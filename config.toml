@@ -1,0 +1,10 @@
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[music]
+default_platform = "163"
+auto_parse_url = true
+auto_parse_card = true
+search_limit = 5
+send_mode = "voice"

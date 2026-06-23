@@ -158,7 +158,7 @@ class MusicPlugin(MaiBotPlugin):
             return p
         if p in ("网易", "netease", "网易云音乐"):
             return "163"
-        if p in ("qq", "qq音乐", "qqmusic"):
+        if p in ("qq音乐", "qqmusic"):
             return "qq"
         default = self.config.music.default_platform.strip().lower()
         return default if default in ("163", "qq") else "163"
@@ -668,33 +668,18 @@ class MusicPlugin(MaiBotPlugin):
                 else:
                     continue
 
-            # QQ 音乐需要 strMediaMid 构造正确的播放 filename
-            # URL 只能解析出 song_mid，通过详情接口补查 media_id
-            media_id = ""
-            if platform == "qq":
-                api = self._get_api()
-                try:
-                    detail = await api.get_qq_song_detail(song_id)
-                    if detail:
-                        media_id = detail.media_id
-                except Exception:
-                    self.ctx.logger.debug("QQ音乐详情查询失败: %s", song_id)
-
-            # 发送语音音频
-            api = self._get_api()
-            try:
-                audio_url = await api.get_song_url(song_id, platform, media_id)
-                if audio_url:
-                    await self.ctx.send.custom(
-                        "voiceurl",
-                        {"url": audio_url},
-                        stream_id,
-                    )
-                    self.ctx.logger.info("已解析音乐链接: %s %s", platform, song_id)
-                else:
-                    self.ctx.logger.info("未获取到音频URL: %s %s", platform, song_id)
-            except Exception:
-                self.ctx.logger.exception("发送语音音频失败: %s %s", platform, song_id)
+            # 发送语音音频（_send_song 内部会补查 QQ 音乐 media_id）
+            await self._send_song(
+                SongInfo(
+                    song_id=song_id,
+                    name="",
+                    artists="",
+                    album="",
+                    platform=platform,
+                ),
+                stream_id,
+            )
+            self.ctx.logger.info("已解析音乐链接: %s %s", platform, song_id)
 
             # 只处理第一个匹配的音乐链接，拦截消息
             return {"action": "abort"}

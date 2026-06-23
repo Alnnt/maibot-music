@@ -6,8 +6,9 @@ import json
 import re
 from typing import Any
 
-from maibot_sdk import Command, EventHandler, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
-from maibot_sdk.types import EventType, HookMode, ToolParameterInfo, ToolParamType
+import httpx
+from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
 from .music_api import MusicSearchClient, SongInfo
 from .url_parser import extract_urls, parse_music_card_text, parse_music_url
@@ -570,6 +571,23 @@ class MusicPlugin(MaiBotPlugin):
                 if isinstance(message, dict) and message_id:
                     card_result = await self._resolve_music_card_from_raw(message)
 
+                # 其次从分享文本中的 URL 精确解析歌曲 ID
+                if not card_result and card_info.url:
+                    url_result = parse_music_url(card_info.url)
+                    if url_result:
+                        platform, song_id = url_result
+                        # 网易云短链接需要重定向解析
+                        if platform == "163_short":
+                            api = self._get_api()
+                            resolved_url = await api.resolve_short_url(card_info.url)
+                            if resolved_url:
+                                short_result = parse_music_url(resolved_url)
+                                if short_result and short_result[0] != "163_short":
+                                    platform, song_id = short_result
+                                    card_result = (platform, song_id)
+                        else:
+                            card_result = url_result
+
                 if card_result:
                     platform, song_id = card_result
                     await self._send_song(
@@ -595,8 +613,11 @@ class MusicPlugin(MaiBotPlugin):
                 has_music_link = any(
                     parse_music_url(u) is not None for u in urls_in_text
                 )
-                if not has_music_link:
-                    # 无音乐链接，用歌名+歌手搜索
+                if has_music_link and self.config.music.auto_parse_url:
+                    # 有音乐链接且 URL 解析已开启，跳到步骤2处理
+                    pass
+                else:
+                    # 无音乐链接或 URL 解析已关闭，用歌名+歌手搜索
                     platform = card_info.platform or self._resolve_platform("")
                     api = self._get_api()
                     try:
@@ -616,8 +637,6 @@ class MusicPlugin(MaiBotPlugin):
                     else:
                         self.ctx.logger.info("音乐卡片搜索无结果: %s", card_info.query)
                         return {"action": "continue"}
-
-                # 有音乐链接，跳到步骤2让 URL 解析处理
 
         # ── 2. URL 解析 ──
         if not self.config.music.auto_parse_url:

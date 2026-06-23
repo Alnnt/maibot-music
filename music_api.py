@@ -73,7 +73,7 @@ def _aes_ecb_encrypt(key: bytes, data: bytes) -> bytes:
     return encryptor.update(padded) + encryptor.finalize()
 
 
-def _eapi_encrypt(url: str, params: dict[str, Any]) -> tuple[str, str]:
+def _eapi_encrypt(url: str, params: dict[str, Any]) -> str:
     """网易云音乐 eapi 加密。
 
     Args:
@@ -81,7 +81,7 @@ def _eapi_encrypt(url: str, params: dict[str, Any]) -> tuple[str, str]:
         params: 请求参数字典。
 
     Returns:
-        (enc_text, enc_sec_key) — 加密后的请求参数。
+        加密后的请求参数字符串。
     """
     data_text = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
 
@@ -144,9 +144,15 @@ class MusicSearchClient:
 
     async def close(self) -> None:
         """关闭 HTTP 客户端。"""
-        await self._netease_client.aclose()
-        await self._eapi_client.aclose()
-        await self._qq_client.aclose()
+        for client in (
+            self._netease_client,
+            self._eapi_client,
+            self._qq_client,
+        ):
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
     async def search(self, query: str, platform: str, limit: int = 5) -> list[SongInfo]:
         """搜索歌曲。
@@ -266,6 +272,69 @@ class MusicSearchClient:
                     )
                 )
         return results
+
+    # ===== 歌曲详情 =====
+
+    async def get_qq_song_detail(self, song_mid: str) -> SongInfo | None:
+        """通过 song_mid 查询 QQ 音乐歌曲详情，获取 strMediaMid 等信息。
+
+        Args:
+            song_mid: 歌曲 mid。
+
+        Returns:
+            SongInfo，查询失败返回 None。
+        """
+        req_data = {
+            "req_0": {
+                "module": "music.pf_song_detail_svr",
+                "method": "get_song_detail_yqq",
+                "param": {"song_mid": song_mid},
+            },
+            "comm": {
+                "format": "json",
+                "ct": 19,
+                "cv": 0,
+            },
+        }
+
+        try:
+            resp = await self._qq_client.post(
+                "https://u.y.qq.com/cgi-bin/musicu.fcg",
+                json=req_data,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.TimeoutException:
+            logger.warning("QQ音乐歌曲详情查询超时: %s", song_mid)
+            return None
+        except Exception:
+            logger.exception("QQ音乐歌曲详情查询异常: %s", song_mid)
+            return None
+
+        try:
+            track = data["req_0"]["data"]["track_info"]
+        except (KeyError, IndexError, TypeError):
+            logger.debug("QQ音乐歌曲详情解析失败: %s", song_mid)
+            return None
+
+        mid = str(track.get("mid", "") or song_mid)
+        name = str(track.get("name", ""))
+        singers = track.get("singer", [])
+        artists = ", ".join(s.get("name", "") for s in singers if s.get("name"))
+        album = str(track.get("album", {}).get("name", ""))
+        media_mid = str(track.get("file", {}).get("media_mid", "") or mid)
+
+        if not mid or not name:
+            return None
+
+        return SongInfo(
+            song_id=mid,
+            name=name,
+            artists=artists,
+            album=album,
+            platform="qq",
+            media_id=media_mid,
+        )
 
     # ===== 获取音频 URL =====
 

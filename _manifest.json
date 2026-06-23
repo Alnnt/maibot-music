@@ -1,14 +1,14 @@
 {
   "manifest_version": 2,
   "id": "maibot-team.music",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "音乐插件",
-  "description": "搜索点歌、解析音乐链接，发送音乐卡片和语音音频，支持网易云音乐和QQ音乐",
+  "description": "搜索点歌、解析音乐链接，发送语音音频，支持网易云音乐和QQ音乐",
   "author": {
     "name": "磐冰",
     "url": "https://github.com/MaiM-with-u"
   },
-  "license": "GPL-v3.0-or-later",
+  "license": "MIT",
   "urls": {
     "repository": "https://github.com/MaiM-with-u/maibot",
     "homepage": "https://github.com/MaiM-with-u/maibot",

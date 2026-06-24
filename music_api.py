@@ -486,7 +486,7 @@ class MusicSearchClient:
             )
             final_url = str(resp.url)
             logger.debug("网易云直链重定向: song_id=%s final_url=%s", song_id, final_url)
-            if final_url and any(ext in final_url for ext in (".mp3", ".flac", ".m4a")):
+            if final_url and any(ext in final_url for ext in (".mp3", ".flac", ".m4a", ".wav", ".ogg", ".aac")):
                 return final_url
         except Exception:
             logger.debug("网易云音乐直链获取失败: %s", song_id)
@@ -592,12 +592,12 @@ class MusicSearchClient:
             return None
 
         # 选择非 ws.stream 的域名（优先 HTTPS）
-        domain = sip[0] if sip else ""
+        domain = ""
         for s in sip:
             if s.startswith("https://"):
                 domain = s
                 break
-        if not domain:
+        if not domain and sip:
             domain = sip[0]
 
         return f"{domain}{purl}"

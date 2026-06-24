@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "id": "maibot-team.music",
+  "id": "github.pan-ice.music",
   "version": "1.0.0",
   "name": "音乐插件",
   "description": "搜索点歌、解析音乐链接，发送语音音频，支持网易云音乐和QQ音乐",

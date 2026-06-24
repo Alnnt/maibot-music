@@ -37,8 +37,7 @@
   ],
   "capabilities": [
     "send.text",
-    "send.custom",
-    "config.get"
+    "send.custom"
   ],
   "i18n": {
     "default_locale": "zh-CN",

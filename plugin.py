@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
 from typing import Any
 
-import httpx
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
@@ -25,7 +25,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_icon__ = "package"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=False, description="是否启用插件")
+    enabled: bool = Field(default=True, description="是否启用插件")
     config_version: str = Field(default="1.0.0", description="配置版本")
 
 
@@ -108,9 +108,6 @@ class MusicPluginConfig(PluginConfigBase):
 
 # ===== 待选状态 =====
 
-# key: stream_id, value: (结果列表, 平台, 创建时间戳)
-_pending_choices: dict[str, tuple[list[SongInfo], str, float]] = {}
-
 # 待选状态过期时间（秒）
 _PENDING_TTL = 300
 
@@ -126,14 +123,16 @@ class MusicPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._api: MusicSearchClient | None = None
+        # key: stream_id（等于消息的 session_id）, value: (结果列表, 平台, 创建时间戳)
+        self._pending_choices: dict[str, tuple[list[SongInfo], str, float]] = {}
+        self._pending_lock = asyncio.Lock()
 
-    @staticmethod
-    def _clean_expired_pending() -> None:
+    def _clean_expired_pending(self) -> None:
         """清理已过期的待选状态。"""
         now = time.monotonic()
-        expired = [sid for sid, (_, _, ts) in _pending_choices.items() if now - ts > _PENDING_TTL]
+        expired = [sid for sid, (_, _, ts) in self._pending_choices.items() if now - ts > _PENDING_TTL]
         for sid in expired:
-            del _pending_choices[sid]
+            del self._pending_choices[sid]
 
     def _get_api(self) -> MusicSearchClient:
         """获取或创建 API 客户端。"""
@@ -153,6 +152,8 @@ class MusicPlugin(MaiBotPlugin):
             self._api = MusicSearchClient(
                 netease_cookie=netease_cookie,
                 qq_cookie=qq_cookie,
+                napcat_url=self.config.napcat.http_url,
+                napcat_token=self.config.napcat.http_token,
             )
         return self._api
 
@@ -191,12 +192,15 @@ class MusicPlugin(MaiBotPlugin):
         lines.append("使用 /选歌 <序号> 选择歌曲，如 /选歌 1")
         return "\n".join(lines)
 
-    async def _send_song(self, song: SongInfo, stream_id: str) -> None:
+    async def _send_song(self, song: SongInfo, stream_id: str) -> bool:
         """发送歌曲语音音频。
 
         Args:
             song: SongInfo 对象。
             stream_id: 目标消息流 ID。
+
+        Returns:
+            是否成功发送音频（或提示消息）。获取音频 URL 失败返回 False。
         """
         api = self._get_api()
 
@@ -215,7 +219,7 @@ class MusicPlugin(MaiBotPlugin):
             audio_url = await api.get_song_url(song.song_id, song.platform, media_id)
         except Exception:
             self.ctx.logger.exception("获取音频URL异常: %s", song.song_id)
-            return
+            return False
 
         if not audio_url:
             self.ctx.logger.info("未获取到音频URL: %s %s", song.platform, song.song_id)
@@ -223,7 +227,7 @@ class MusicPlugin(MaiBotPlugin):
                 f"找到「{song.display()}」但无法获取音频，可能因版权限制",
                 stream_id,
             )
-            return
+            return False
 
         try:
             await self.ctx.send.custom(
@@ -234,6 +238,9 @@ class MusicPlugin(MaiBotPlugin):
         except Exception:
             self.ctx.logger.exception("发送语音音频失败: %s", audio_url)
             await self.ctx.send.text(song.display(), stream_id)
+            return False
+
+        return True
 
     # ===== 生命周期 =====
 
@@ -246,7 +253,7 @@ class MusicPlugin(MaiBotPlugin):
         if self._api is not None:
             await self._api.close()
             self._api = None
-        _pending_choices.clear()
+        self._pending_choices.clear()
         self.ctx.logger.info("音乐插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -255,6 +262,52 @@ class MusicPlugin(MaiBotPlugin):
             await self._api.close()
             self._api = None
         self.ctx.logger.info("音乐插件配置已更新，API 客户端已重置")
+
+    # ===== 搜索核心逻辑 =====
+
+    async def _do_search_and_send(
+        self,
+        query: str,
+        platform: str = "",
+        stream_id: str = "",
+    ) -> tuple[bool, str]:
+        """搜索歌曲并发送，供 Tool 和 Command 共用。
+
+        Args:
+            query: 搜索关键词。
+            platform: 平台标识（可为空，使用默认值）。
+            stream_id: 目标消息流 ID。
+
+        Returns:
+            (成功与否, 描述文本) 元组。
+        """
+        resolved_platform = self._resolve_platform(platform)
+        api = self._get_api()
+
+        try:
+            results = await api.search(query, resolved_platform, limit=self.config.music.search_limit)
+        except Exception:
+            self.ctx.logger.exception("音乐搜索异常: %s", query)
+            await self.ctx.send.text("搜索歌曲时出错，请稍后再试", stream_id)
+            return False, "搜索歌曲时出错，请稍后再试"
+
+        if not results:
+            platform_name = "网易云音乐" if resolved_platform == "163" else "QQ音乐"
+            msg = f"在{platform_name}上未找到「{query}」相关歌曲"
+            await self.ctx.send.text(msg, stream_id)
+            return False, msg
+
+        # 只有一首结果时直接发送
+        if len(results) == 1:
+            sent = await self._send_song(results[0], stream_id)
+            return sent, f"已发送: {results[0].display()}" if sent else f"发送失败: {results[0].display()}"
+
+        # 多首结果时列出选择
+        async with self._pending_lock:
+            self._pending_choices[stream_id] = (results, resolved_platform, time.monotonic())
+        text = self._format_results(results)
+        await self.ctx.send.text(text, stream_id)
+        return True, f"找到{len(results)}首歌曲，已列出供用户选择"
 
     # ===== Tool 组件 =====
 
@@ -289,36 +342,15 @@ class MusicPlugin(MaiBotPlugin):
         if not query.strip():
             return {"content": "请提供歌曲名或关键词"}
 
-        resolved_platform = self._resolve_platform(platform)
-        api = self._get_api()
-
-        try:
-            results = await api.search(query, resolved_platform, limit=self.config.music.search_limit)
-        except Exception:
-            self.ctx.logger.exception("音乐搜索异常: %s", query)
-            return {"content": "搜索歌曲时出错，请稍后再试"}
-
-        if not results:
-            platform_name = "网易云音乐" if resolved_platform == "163" else "QQ音乐"
-            return {"content": f"在{platform_name}上未找到「{query}」相关歌曲"}
-
-        # 只有一首结果时直接发送
-        if len(results) == 1:
-            await self._send_song(results[0], stream_id)
-            return {"content": f"已发送: {results[0].display()}"}
-
-        # 多首结果时列出选择
-        _pending_choices[stream_id] = (results, resolved_platform, time.monotonic())
-        text = self._format_results(results)
-        await self.ctx.send.text(text, stream_id)
-        return {"content": f"找到{len(results)}首歌曲，已列出供用户选择"}
+        success, message = await self._do_search_and_send(query, platform, stream_id)
+        return {"content": message}
 
     # ===== Command 组件 =====
 
     @Command(
         "点歌",
         description="点歌命令，搜索歌曲并列出选择",
-        pattern=r"^/点歌(?:\s+(163|qq|网易云音乐|网易|netease|qq音乐|qqmusic))?\s+(.+)$",
+        pattern=r"^/点歌(?:\s+(?P<platform>163|qq|网易云音乐|网易|netease|qq音乐|qqmusic))?\s+(?P<query>.+)$",
     )
     async def handle_music_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         """处理 /点歌 命令。"""
@@ -326,52 +358,32 @@ class MusicPlugin(MaiBotPlugin):
         if not isinstance(matched_groups, dict):
             matched_groups = {}
 
-        platform_hint = str(matched_groups.get("1", "") or kwargs.get("1", "") or "").strip()
-        query = str(matched_groups.get("2", "") or "").strip()
+        platform_hint = str(matched_groups.get("platform", "") or "").strip()
+        query = str(matched_groups.get("query", "") or "").strip()
 
         # 如果 matched_groups 没有分组信息，尝试从原始消息解析
         if not query:
             raw_text = str(kwargs.get("text", "") or kwargs.get("message", "") or "")
-            match = re.match(r"^/点歌(?:\s+(163|qq|网易云音乐|网易|netease|qq音乐|qqmusic))?\s+(.+)$", raw_text, re.DOTALL)
+            match = re.match(
+                r"^/点歌(?:\s+(?P<platform>163|qq|网易云音乐|网易|netease|qq音乐|qqmusic))?\s+(?P<query>.+)$",
+                raw_text,
+                re.DOTALL,
+            )
             if match:
-                platform_hint = platform_hint or (match.group(1) or "")
-                query = match.group(2) or ""
+                platform_hint = platform_hint or (match.group("platform") or "")
+                query = match.group("query") or ""
 
         if not query:
             await self.ctx.send.text("用法：/点歌 [163|qq] <歌曲名>", stream_id)
             return False, "缺少歌曲名", True
 
-        resolved_platform = self._resolve_platform(platform_hint)
-        api = self._get_api()
-
-        try:
-            results = await api.search(query, resolved_platform, limit=self.config.music.search_limit)
-        except Exception:
-            self.ctx.logger.exception("音乐搜索异常: %s", query)
-            await self.ctx.send.text("搜索歌曲时出错，请稍后再试", stream_id)
-            return False, "搜索异常", True
-
-        if not results:
-            platform_name = "网易云音乐" if resolved_platform == "163" else "QQ音乐"
-            await self.ctx.send.text(f"在{platform_name}上未找到「{query}」相关歌曲", stream_id)
-            return False, "未找到歌曲", True
-
-        # 只有一首结果时直接发送
-        if len(results) == 1:
-            song = results[0]
-            await self._send_song(song, stream_id)
-            return True, f"已点歌: {song.display()}", True
-
-        # 多首结果时列出选择
-        _pending_choices[stream_id] = (results, resolved_platform, time.monotonic())
-        text = self._format_results(results)
-        await self.ctx.send.text(text, stream_id)
-        return True, f"列出{len(results)}首歌曲供选择", True
+        success, message = await self._do_search_and_send(query, platform_hint, stream_id)
+        return success, message, True
 
     @Command(
         "选歌",
         description="选择搜索结果中的歌曲",
-        pattern=r"^/选歌\s+(\d+)$",
+        pattern=r"^/选歌\s+(?P<index>\d+)$",
     )
     async def handle_select_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         """处理 /选歌 命令。"""
@@ -379,13 +391,13 @@ class MusicPlugin(MaiBotPlugin):
         if not isinstance(matched_groups, dict):
             matched_groups = {}
 
-        index_str = str(matched_groups.get("1", "") or "").strip()
+        index_str = str(matched_groups.get("index", "") or "").strip()
 
         if not index_str:
             raw_text = str(kwargs.get("text", "") or kwargs.get("message", "") or "")
-            match = re.match(r"^/选歌\s+(\d+)$", raw_text)
+            match = re.match(r"^/选歌\s+(?P<index>\d+)$", raw_text)
             if match:
-                index_str = match.group(1)
+                index_str = match.group("index")
 
         if not index_str:
             await self.ctx.send.text("用法：/选歌 <序号>", stream_id)
@@ -393,26 +405,27 @@ class MusicPlugin(MaiBotPlugin):
 
         # 查找待选状态
         self._clean_expired_pending()
-        pending = _pending_choices.pop(stream_id, None)
-        if pending is None:
-            await self.ctx.send.text("没有待选的歌曲，请先使用 /点歌 搜索", stream_id)
-            return False, "无待选歌曲", True
+        async with self._pending_lock:
+            pending = self._pending_choices.pop(stream_id, None)
+            if pending is None:
+                await self.ctx.send.text("没有待选的歌曲，请先使用 /点歌 搜索", stream_id)
+                return False, "无待选歌曲", True
 
-        results, _platform, _ts = pending
+            results, _platform, _ts = pending
 
-        try:
-            index = int(index_str)
-        except ValueError:
-            await self.ctx.send.text("请输入有效的数字序号", stream_id)
-            # 放回待选状态
-            _pending_choices[stream_id] = pending
-            return False, "序号无效", True
+            try:
+                index = int(index_str)
+            except ValueError:
+                await self.ctx.send.text("请输入有效的数字序号", stream_id)
+                # 放回待选状态
+                self._pending_choices[stream_id] = pending
+                return False, "序号无效", True
 
-        if index < 1 or index > len(results):
-            await self.ctx.send.text(f"序号超出范围，请输入 1~{len(results)} 之间的数字", stream_id)
-            # 放回待选状态
-            _pending_choices[stream_id] = pending
-            return False, "序号超出范围", True
+            if index < 1 or index > len(results):
+                await self.ctx.send.text(f"序号超出范围，请输入 1~{len(results)} 之间的数字", stream_id)
+                # 放回待选状态
+                self._pending_choices[stream_id] = pending
+                return False, "序号超出范围", True
 
         song = results[index - 1]
         await self._send_song(song, stream_id)
@@ -440,31 +453,16 @@ class MusicPlugin(MaiBotPlugin):
         if not message_id:
             return None
 
-        base_url = self.config.napcat.http_url.strip().rstrip("/")
-        if not base_url:
-            return None
-
+        # message_id 必须是纯数字才能传给 NapCat API
         try:
-            headers: dict[str, str] = {"Content-Type": "application/json"}
-            token = self.config.napcat.http_token.strip()
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"{base_url}/get_msg",
-                    json={"message_id": int(message_id)},
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                raw_detail = resp.json()
-        except Exception:
-            self.ctx.logger.debug("调用 NapCat get_msg 失败: %s", message_id)
+            int_message_id = int(message_id)
+        except ValueError:
+            self.ctx.logger.debug("message_id 非数字，跳过原始消息解析: %s", message_id)
             return None
 
-        # 从响应中提取 data
-        data = raw_detail.get("data") if isinstance(raw_detail, dict) else None
-        if not isinstance(data, dict):
+        api = self._get_api()
+        data = await api.get_raw_message(int_message_id)
+        if not data:
             return None
 
         # 原始消息中的 message 段列表
@@ -507,7 +505,6 @@ class MusicPlugin(MaiBotPlugin):
                     if jump_url:
                         # 网易云短链需要先解析重定向
                         if "163cn.tv" in jump_url:
-                            api = self._get_api()
                             resolved_url = await api.resolve_short_url(jump_url)
                             if resolved_url:
                                 jump_url = resolved_url
@@ -523,7 +520,6 @@ class MusicPlugin(MaiBotPlugin):
                     miniapp_title = str(detail.get("title") or "").strip()
                     if qqdocurl and miniapp_title in ("QQ音乐", "网易云音乐"):
                         if "163cn.tv" in qqdocurl:
-                            api = self._get_api()
                             resolved_url = await api.resolve_short_url(qqdocurl)
                             if resolved_url:
                                 qqdocurl = resolved_url
@@ -539,6 +535,7 @@ class MusicPlugin(MaiBotPlugin):
         description="解析音乐链接和音乐卡片，发送语音音频",
         mode=HookMode.BLOCKING,
         order="normal",
+        timeout_ms=15000,
     )
     async def handle_music_url_parse(self, **kwargs: Any) -> dict[str, Any]:
         """解析消息中的音乐链接和音乐分享卡片，发送音乐卡片和语音。
@@ -550,31 +547,23 @@ class MusicPlugin(MaiBotPlugin):
         if not message:
             return {"action": "continue"}
 
-        # 提取消息文本和 stream_id
-        text = ""
-        stream_id = ""
-        message_id = ""
+        # 提取消息文本和 session_id
+        # SDK 保证 message 为 dict，非 dict 的情况不做处理
+        if not isinstance(message, dict):
+            return {"action": "continue"}
 
-        if isinstance(message, dict):
-            text = (
-                message.get("processed_plain_text", "")
-                or message.get("plain_text", "")
-                or message.get("display_message", "")
-                or ""
-            )
-            stream_id = str(message.get("stream_id", "") or message.get("session_id", "") or "")
-            message_id = str(message.get("message_id", "") or "")
-            if not text:
-                raw_msg = message.get("raw_message", [])
-                if isinstance(raw_msg, list):
-                    text = " ".join(
-                        str(seg.get("data", "")) if isinstance(seg, dict) and seg.get("type") == "text" else ""
-                        for seg in raw_msg
-                    ).strip()
-        else:
-            text = str(message)
+        text = message.get("processed_plain_text") or ""
+        session_id = str(message.get("session_id", ""))
+        message_id = str(message.get("message_id", ""))
+        if not text:
+            raw_msg = message.get("raw_message", [])
+            if isinstance(raw_msg, list):
+                text = " ".join(
+                    str(seg.get("data", "")) if isinstance(seg, dict) and seg.get("type") == "text" else ""
+                    for seg in raw_msg
+                ).strip()
 
-        if not text or not stream_id:
+        if not text or not session_id:
             return {"action": "continue"}
 
         # ── 1. 音乐卡片解析 ──
@@ -583,10 +572,12 @@ class MusicPlugin(MaiBotPlugin):
             if card_info and card_info.query:
                 # 优先通过 get_msg API 从原始消息中精确解析歌曲 ID
                 card_result = None
-                if isinstance(message, dict) and message_id:
+                if message_id:
                     card_result = await self._resolve_music_card_from_raw(message)
 
                 # 其次从分享文本中的 URL 精确解析歌曲 ID
+                # card_info.url 来自 parse_music_card_text 对分享文本的提取，
+                # 对于网易云短链接，card_info.url 就是短链接本身
                 if not card_result and card_info.url:
                     url_result = parse_music_url(card_info.url)
                     if url_result:
@@ -605,7 +596,7 @@ class MusicPlugin(MaiBotPlugin):
 
                 if card_result and card_result[0] not in ("163_short", "qq_short"):
                     platform, song_id = card_result
-                    await self._send_song(
+                    sent = await self._send_song(
                         SongInfo(
                             song_id=song_id,
                             name=card_info.song_name,
@@ -613,7 +604,7 @@ class MusicPlugin(MaiBotPlugin):
                             album="",
                             platform=platform,
                         ),
-                        stream_id,
+                        session_id,
                     )
                     self.ctx.logger.info(
                         "已解析音乐卡片(精确): %s → %s %s",
@@ -621,7 +612,7 @@ class MusicPlugin(MaiBotPlugin):
                         platform,
                         song_id,
                     )
-                    return {"action": "abort"}
+                    return {"action": "abort" if sent else "continue"}
 
                 # 精确解析失败，检查文本中是否有音乐 URL 可供步骤2处理
                 urls_in_text = extract_urls(text)
@@ -642,13 +633,13 @@ class MusicPlugin(MaiBotPlugin):
                         results = []
 
                     if results:
-                        await self._send_song(results[0], stream_id)
+                        sent = await self._send_song(results[0], session_id)
                         self.ctx.logger.info(
                             "已解析音乐卡片(搜索): %s → %s",
                             card_info.query,
                             results[0].display(),
                         )
-                        return {"action": "abort"}
+                        return {"action": "abort" if sent else "continue"}
                     else:
                         self.ctx.logger.info("音乐卡片搜索无结果: %s", card_info.query)
                         return {"action": "continue"}
@@ -670,13 +661,13 @@ class MusicPlugin(MaiBotPlugin):
 
             platform, song_id = result
 
-            # 处理网易云短链接（163cn.tv）— 需重定向解析
-            if platform == "163_short":
+            # 处理短链接（163cn.tv / c6.y.qq.com）— 需重定向解析
+            if platform in ("163_short", "qq_short"):
                 api = self._get_api()
                 resolved_url = await api.resolve_short_url(url)
                 if resolved_url:
                     short_result = parse_music_url(resolved_url)
-                    if short_result and short_result[0] != "163_short":
+                    if short_result and short_result[0] not in ("163_short", "qq_short"):
                         platform, song_id = short_result
                     else:
                         continue
@@ -684,7 +675,7 @@ class MusicPlugin(MaiBotPlugin):
                     continue
 
             # 发送语音音频（_send_song 内部会补查 QQ 音乐 media_id）
-            await self._send_song(
+            sent = await self._send_song(
                 SongInfo(
                     song_id=song_id,
                     name="",
@@ -692,12 +683,12 @@ class MusicPlugin(MaiBotPlugin):
                     album="",
                     platform=platform,
                 ),
-                stream_id,
+                session_id,
             )
             self.ctx.logger.info("已解析音乐链接: %s %s", platform, song_id)
 
-            # 只处理第一个匹配的音乐链接，拦截消息
-            return {"action": "abort"}
+            # 只处理第一个匹配的音乐链接，发送成功时拦截消息
+            return {"action": "abort" if sent else "continue"}
 
         # 未匹配到任何音乐链接/卡片，不拦截
         return {"action": "continue"}

@@ -17,6 +17,7 @@ def parse_music_url(text: str) -> tuple[str, str] | None:
         - QQ音乐: y.qq.com/n/ryqq/songDetail/xxx
         - QQ音乐: y.qq.com/n/m/detail/song/xxx
         - QQ音乐: i.y.qq.com/v8/playsong.html?songmid=xxx（卡片 jumpUrl）
+        - QQ音乐: c6.y.qq.com/base/fcgi-bin/u?__=xxx（短链接，需重定向解析）
 
     Args:
         text: 包含 URL 的文本。
@@ -24,6 +25,7 @@ def parse_music_url(text: str) -> tuple[str, str] | None:
     Returns:
         (platform, song_id) 元组，未匹配返回 None。
         对于网易云短链接，返回 ("163_short", 短链ID)，需要调用方做重定向解析。
+        对于QQ音乐短链接，返回 ("qq_short", 短链ID)，需要调用方做重定向解析。
     """
     if not text:
         return None
@@ -36,24 +38,30 @@ def parse_music_url(text: str) -> tuple[str, str] | None:
     if netease_match:
         return ("163", netease_match.group(1))
 
-    # 网易云音乐短链接 — 163cn.tv/xxx（需重定向解析）
+    # 网易云音乐短链接 — 163cn.tv/xxx 或 163cn.tv/a/xxx（需重定向解析）
+    # 匹配整个路径部分作为短链 ID（包括中间的 /a/ 等路径段）
     netease_short_match = re.search(
-        r"163cn\.tv/([A-Za-z0-9]+)",
+        r"163cn\.tv/([A-Za-z0-9]+(?:/[A-Za-z0-9]+)*)",
         text,
     )
     if netease_short_match:
         return ("163_short", netease_short_match.group(1))
 
+    # QQ音乐短链接 — c6.y.qq.com/base/fcgi-bin/u?__=xxx（需重定向解析）
+    qq_short_match = re.search(
+        r"c\d+\.y\.qq\.com/base/fcgi-bin/u\?__=([A-Za-z0-9+/=_-]+)",
+        text,
+    )
+    if qq_short_match:
+        return ("qq_short", qq_short_match.group(1))
+
     # QQ音乐 — i.y.qq.com/v8/playsong.html?songmid=xxx（卡片 jumpUrl）
     qq_playsong_match = re.search(
-        r"y\.qq\.com/v8/playsong\.html\?",
+        r"y\.qq\.com/v8/playsong\.html\?[^\s]*?songmid=([A-Za-z0-9]+)",
         text,
     )
     if qq_playsong_match:
-        # 提取 songmid（必须用 songmid，不能回退到 media_mid，否则下游 filename 构造错误）
-        songmid_match = re.search(r"[?&]songmid=([A-Za-z0-9]+)", text)
-        if songmid_match and songmid_match.group(1):
-            return ("qq", songmid_match.group(1))
+        return ("qq", qq_playsong_match.group(1))
 
     # QQ音乐 — songDetail/xxx 格式
     qq_match = re.search(
@@ -74,20 +82,10 @@ def parse_music_url(text: str) -> tuple[str, str] | None:
     return None
 
 
-def has_music_url(text: str) -> bool:
-    """检查文本中是否包含音乐链接。
-
-    Args:
-        text: 待检查文本。
-
-    Returns:
-        是否包含音乐链接。
-    """
-    return parse_music_url(text) is not None
-
-
 def extract_urls(text: str) -> list[str]:
     """从文本中提取所有 URL。
+
+    自动去除 URL 尾部附带的标点符号（中英文句号、逗号、右括号等）。
 
     Args:
         text: 待提取文本。
@@ -99,7 +97,16 @@ def extract_urls(text: str) -> list[str]:
         r"https?://[^\s<>\"]+|www\.[^\s<>\"]+",
         re.IGNORECASE,
     )
-    return url_pattern.findall(text)
+    raw_urls = url_pattern.findall(text)
+    # 去除 URL 尾部附带的标点符号（逐个从尾部移除，避免误删合法字符）
+    _TRAILING_PUNCTS = frozenset("。，、！？；：""''））》」』,;!?")
+    cleaned: list[str] = []
+    for url in raw_urls:
+        while url and url[-1] in _TRAILING_PUNCTS:
+            url = url[:-1]
+        if url:
+            cleaned.append(url)
+    return cleaned
 
 
 # ===== 音乐卡片文本解析 =====
@@ -146,11 +153,17 @@ class MusicCardInfo:
         artist: str = "",
         url: str = "",
     ) -> None:
-        self.platform = platform  # "163" 或 "qq"
+        self.platform = platform  # "163" 或 "qq"，空字符串表示无法确定平台
         self.query = query  # 搜索关键词（歌名 或 歌名 歌手）
         self.song_name = song_name  # 歌曲名
         self.artist = artist  # 歌手名
         self.url = url  # 分享文本中的音乐链接（可能包含精确的歌曲 ID）
+
+    def __repr__(self) -> str:
+        return (
+            f"MusicCardInfo(platform={self.platform!r}, query={self.query!r}, "
+            f"song_name={self.song_name!r}, artist={self.artist!r}, url={self.url!r})"
+        )
 
 
 def parse_music_card_text(text: str) -> MusicCardInfo | None:

@@ -5,12 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import random
+import re
+import secrets
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 logger = logging.getLogger("maibot-music.api")
@@ -66,7 +66,7 @@ class SongInfo:
 
 def _aes_ecb_encrypt(key: bytes, data: bytes) -> bytes:
     """AES-128-ECB 加密，PKCS7 填充。"""
-    cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
     encryptor = cipher.encryptor()
     pad_len = 16 - (len(data) % 16)
     padded = data + bytes([pad_len] * pad_len)
@@ -91,6 +91,7 @@ def _eapi_encrypt(url: str, params: dict[str, Any]) -> str:
     sign_text = f"{url}-36cd479b6b5-{data_text}-36cd479b6b5-{md5_hash}"
 
     enc_text = _aes_ecb_encrypt(_EAPI_KEY, sign_text.encode()).hex().upper()
+    # 网易云 API 要求 hex 编码使用大写字母
     return enc_text
 
 
@@ -100,15 +101,21 @@ class MusicSearchClient:
     Args:
         netease_cookie: 网易云音乐 Cookie，形如 {"MUSIC_U": "...", "__csrf": "..."}。
         qq_cookie: QQ音乐 Cookie，形如 {"uin": "...", "qqmusic_key": "..."}。
+        napcat_url: NapCat HTTP API 地址（用于获取消息原始 JSON 解析音乐卡片）。
+        napcat_token: NapCat HTTP API 访问令牌。
     """
 
     def __init__(
         self,
         netease_cookie: dict[str, str] | None = None,
         qq_cookie: dict[str, str] | None = None,
+        napcat_url: str = "",
+        napcat_token: str = "",
     ) -> None:
         self._netease_cookie = netease_cookie or {}
         self._qq_cookie = qq_cookie or {}
+        self._napcat_url = napcat_url.strip().rstrip("/")
+        self._napcat_token = napcat_token.strip()
 
         # 将用户提供的 Cookie 注入到 HTTP 客户端
         netease_cookies = {}
@@ -133,14 +140,23 @@ class MusicSearchClient:
             headers=_EAPI_HEADERS,
             cookies=netease_cookies,
             timeout=_REQUEST_TIMEOUT,
-            follow_redirects=True,
         )
         self._qq_client = httpx.AsyncClient(
             headers=_QQ_HEADERS,
             cookies=qq_cookies,
             timeout=_REQUEST_TIMEOUT,
-            follow_redirects=True,
         )
+        # NapCat HTTP API 客户端（用于获取消息原始 JSON 解析音乐卡片）
+        napcat_headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._napcat_token:
+            napcat_headers["Authorization"] = f"Bearer {self._napcat_token}"
+        self._napcat_client: httpx.AsyncClient | None = None
+        if self._napcat_url:
+            self._napcat_client = httpx.AsyncClient(
+                base_url=self._napcat_url,
+                headers=napcat_headers,
+                timeout=_REQUEST_TIMEOUT,
+            )
 
     async def close(self) -> None:
         """关闭 HTTP 客户端。"""
@@ -148,7 +164,10 @@ class MusicSearchClient:
             self._netease_client,
             self._eapi_client,
             self._qq_client,
+            self._napcat_client,
         ):
+            if client is None:
+                continue
             try:
                 await client.aclose()
             except Exception:
@@ -496,7 +515,8 @@ class MusicSearchClient:
     async def _get_qq_song_url(self, song_mid: str, media_mid: str = "") -> str | None:
         """获取QQ音乐歌曲的播放 URL。
 
-        使用 vkey.GetVkeyServer 接口。
+        使用 vkey.GetVkeyServer 接口，一次性请求所有音质等级，
+        按优先级返回第一个有效的播放链接。
 
         Args:
             song_mid: 歌曲 mid。
@@ -509,49 +529,46 @@ class MusicSearchClient:
         """
         if not media_mid:
             media_mid = song_mid
-        # 按音质从高到低尝试：
-        # F000 = FLAC 无损, A000 = AIFF, M800 = 320kbps MP3,
+        # 按音质从高到低构造 filename 列表：
+        # F000 = FLAC 无损, M800 = 320kbps MP3,
         # M500 = 128kbps MP3, C400 = 96kbps M4A
         # filename 格式: {prefix}{songmid}{mediaMid}{ext}
-        for prefix, ext in [
+        quality_prefixes = [
             ("F000", ".flac"),
             ("M800", ".mp3"),
             ("M500", ".mp3"),
             ("C400", ".m4a"),
-        ]:
-            filename = f"{prefix}{song_mid}{media_mid}{ext}"
-            url = await self._get_qq_vkey(filename, song_mid)
-            if url:
-                return url
+        ]
+        filenames = [f"{prefix}{song_mid}{media_mid}{ext}" for prefix, ext in quality_prefixes]
+        return await self._get_qq_vkey_batch(filenames, song_mid)
 
-        return None
-
-    async def _get_qq_vkey(self, filename: str, song_mid: str) -> str | None:
-        """通过 QQ 音乐 vkey 接口获取播放 URL。
+    async def _get_qq_vkey_batch(self, filenames: list[str], song_mid: str) -> str | None:
+        """通过 QQ 音乐 vkey 接口批量获取播放 URL，按音质优先级返回第一个有效链接。
 
         Args:
-            filename: 构造的文件名。
+            filenames: 按音质从高到低排列的文件名列表。
             song_mid: 歌曲 mid。
 
         Returns:
             音频 URL，获取失败返回 None。
         """
-        guid = str(random.randint(1000000000, 9999999999))
+        guid = str(secrets.randbelow(9000000000) + 1000000000)
 
         # 从配置获取登录态
         uin = self._qq_cookie.get("uin", "0")
         qqmusic_key = self._qq_cookie.get("qqmusic_key", "")
         loginflag = 1 if uin != "0" else 0
 
+        # 一次请求发送所有音质 filename，songmid 也对应扩展
         req_data = {
             "req_0": {
                 "module": "vkey.GetVkeyServer",
                 "method": "CgiGetVkey",
                 "param": {
-                    "filename": [filename],
+                    "filename": filenames,
                     "guid": guid,
-                    "songmid": [song_mid],
-                    "songtype": [0],
+                    "songmid": [song_mid] * len(filenames),
+                    "songtype": [0] * len(filenames),
                     "uin": uin,
                     "loginflag": loginflag,
                     "platform": "20",
@@ -583,12 +600,9 @@ class MusicSearchClient:
 
         try:
             sip = data["req_0"]["data"]["sip"]
-            purl = data["req_0"]["data"]["midurlinfo"][0]["purl"]
+            midurlinfo = data["req_0"]["data"]["midurlinfo"]
         except (KeyError, IndexError):
             logger.debug("QQ音乐vkey响应解析失败: %s", song_mid)
-            return None
-
-        if not purl:
             return None
 
         # 选择非 ws.stream 的域名（优先 HTTPS）
@@ -600,22 +614,100 @@ class MusicSearchClient:
         if not domain and sip:
             domain = sip[0]
 
-        return f"{domain}{purl}"
+        # 按音质优先级遍历，返回第一个有效的播放链接
+        for info in midurlinfo:
+            purl = info.get("purl", "") if isinstance(info, dict) else ""
+            if purl:
+                return f"{domain}{purl}"
+
+        return None
 
     # ===== 辅助方法 =====
 
     async def resolve_short_url(self, url: str) -> str | None:
-        """解析网易云音乐短链接，获取重定向后的完整 URL。
+        """解析音乐短链接，获取重定向后的完整 URL。
+
+        对于 HTTP 302 重定向（如 c6.y.qq.com），只读取 Location header，
+        不下载页面内容。对于 JS 重定向（如 163cn.tv），需要下载 HTML 解析。
 
         Args:
             url: 短链接地址。
 
         Returns:
-            重定向后的 URL，失败返回 None。
+            重定向后的最终 URL，失败返回 None。
         """
+        # 根据域名选择正确的 HTTP 客户端
+        if "y.qq.com" in url:
+            client = self._qq_client
+        else:
+            client = self._netease_client
+
+        # 先尝试只读 Location header（不下载页面）
         try:
-            resp = await self._netease_client.get(url, follow_redirects=True)
-            return str(resp.url)
+            resp = await client.get(url, follow_redirects=False)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("location", "")
+                if location:
+                    logger.debug("短链接HTTP重定向: %s → %s", url, location)
+                    return location
+        except Exception:
+            logger.debug("短链接HTTP重定向解析失败: %s", url)
+
+        # HTTP 重定向未获取到，尝试跟随重定向后从最终 URL 或 HTML 中提取
+        try:
+            resp = await client.get(url, follow_redirects=True)
+            final_url = str(resp.url)
+
+            # 如果最终 URL 已包含 music.163.com 或 y.qq.com，重定向成功
+            if "music.163.com" in final_url or "y.qq.com" in final_url:
+                return final_url
+
+            # 尝试从 HTML 内容中提取跳转 URL（163cn.tv JS 重定向的情况）
+            html = resp.text
+            meta_match = re.search(
+                r'<meta\s+http-equiv=["\']refresh["\']\s+content=["\']?\d+;\s*url=([^"\'>\s]+)',
+                html,
+                re.IGNORECASE,
+            )
+            if meta_match:
+                return meta_match.group(1).strip()
+            js_match = re.search(
+                r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']',
+                html,
+            )
+            if js_match:
+                return js_match.group(1).strip()
+
+            return final_url
         except Exception:
             logger.debug("短链接解析失败: %s", url)
             return None
+
+    async def get_raw_message(self, message_id: int) -> dict[str, Any] | None:
+        """通过 NapCat HTTP API 获取消息原始 JSON。
+
+        Args:
+            message_id: 消息 ID。
+
+        Returns:
+            响应 data 字段，失败返回 None。
+        """
+        if self._napcat_client is None:
+            return None
+
+        try:
+            resp = await self._napcat_client.post(
+                "/get_msg",
+                json={"message_id": message_id},
+            )
+            resp.raise_for_status()
+            raw_detail = resp.json()
+        except Exception:
+            logger.debug("调用 NapCat get_msg 失败: %s", message_id)
+            return None
+
+        data = raw_detail.get("data") if isinstance(raw_detail, dict) else None
+        if not isinstance(data, dict):
+            return None
+
+        return data

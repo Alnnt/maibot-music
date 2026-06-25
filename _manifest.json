@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
-  "id": "github.pan-ice.maibot-music",
-  "version": "1.0.0",
+  "id": "github.pan-ice.music",
+  "version": "1.1.0",
   "name": "音乐插件",
   "description": "搜索点歌、解析音乐链接，发送语音音频，支持网易云音乐和QQ音乐",
   "author": {
@@ -11,8 +11,6 @@
   "license": "MIT",
   "urls": {
     "repository": "https://github.com/pan-ice/maibot-music",
-    "homepage": "https://github.com/pan-ice/maibot-music",
-    "documentation": "https://github.com/pan-ice/maibot-music",
     "issues": "https://github.com/pan-ice/maibot-music/issues"
   },
   "host_application": {

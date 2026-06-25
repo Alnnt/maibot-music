@@ -624,17 +624,45 @@ class MusicSearchClient:
 
     # ===== 辅助方法 =====
 
+    # 短链接重定向允许的目标域名白名单
+    _ALLOWED_REDIRECT_HOSTS = frozenset({
+        "music.163.com",
+        "y.music.163.com",
+        "y.qq.com",
+        "i.y.qq.com",
+        "c6.y.qq.com",
+    })
+
+    @staticmethod
+    def _is_allowed_redirect(url: str) -> bool:
+        """检查重定向目标 URL 是否在允许的域名白名单内。
+
+        Args:
+            url: 重定向目标 URL。
+
+        Returns:
+            目标 host 在白名单内返回 True。
+        """
+        from urllib.parse import urlparse
+        try:
+            host = urlparse(url).hostname or ""
+        except Exception:
+            return False
+        return host in MusicSearchClient._ALLOWED_REDIRECT_HOSTS
+
     async def resolve_short_url(self, url: str) -> str | None:
         """解析音乐短链接，获取重定向后的完整 URL。
 
         对于 HTTP 302 重定向（如 c6.y.qq.com），只读取 Location header，
         不下载页面内容。对于 JS 重定向（如 163cn.tv），需要下载 HTML 解析。
+        重定向目标仅允许 music.163.com / y.qq.com 等已知音乐服务域名，
+        防止短链被利用指向内网地址（SSRF）。
 
         Args:
             url: 短链接地址。
 
         Returns:
-            重定向后的最终 URL，失败返回 None。
+            重定向后的最终 URL，失败或目标不在白名单内返回 None。
         """
         # 根据域名选择正确的 HTTP 客户端
         if "y.qq.com" in url:
@@ -647,9 +675,11 @@ class MusicSearchClient:
             resp = await client.get(url, follow_redirects=False)
             if resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("location", "")
-                if location:
+                if location and self._is_allowed_redirect(location):
                     logger.debug("短链接HTTP重定向: %s → %s", url, location)
                     return location
+                if location:
+                    logger.warning("短链接重定向目标不在白名单内: %s → %s", url, location)
         except Exception:
             logger.debug("短链接HTTP重定向解析失败: %s", url)
 
@@ -658,8 +688,8 @@ class MusicSearchClient:
             resp = await client.get(url, follow_redirects=True)
             final_url = str(resp.url)
 
-            # 如果最终 URL 已包含 music.163.com 或 y.qq.com，重定向成功
-            if "music.163.com" in final_url or "y.qq.com" in final_url:
+            # 如果最终 URL 在白名单内，重定向成功
+            if self._is_allowed_redirect(final_url):
                 return final_url
 
             # 尝试从 HTML 内容中提取跳转 URL（163cn.tv JS 重定向的情况）
@@ -670,15 +700,25 @@ class MusicSearchClient:
                 re.IGNORECASE,
             )
             if meta_match:
-                return meta_match.group(1).strip()
+                meta_url = meta_match.group(1).strip()
+                if self._is_allowed_redirect(meta_url):
+                    return meta_url
+                logger.warning("短链接meta重定向目标不在白名单内: %s → %s", url, meta_url)
+                return None
             js_match = re.search(
                 r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']',
                 html,
             )
             if js_match:
-                return js_match.group(1).strip()
+                js_url = js_match.group(1).strip()
+                if self._is_allowed_redirect(js_url):
+                    return js_url
+                logger.warning("短链接JS重定向目标不在白名单内: %s → %s", url, js_url)
+                return None
 
-            return final_url
+            # 最终 URL 不在白名单内
+            logger.warning("短链接最终目标不在白名单内: %s → %s", url, final_url)
+            return None
         except Exception:
             logger.debug("短链接解析失败: %s", url)
             return None

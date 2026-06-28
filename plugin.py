@@ -40,6 +40,7 @@ class MusicConfig(PluginConfigBase):
         default="163",
         description="默认音乐平台: 163(网易云) 或 qq(QQ音乐)",
     )
+    command_prefix: str = Field(default="/", description="命令前缀符号，如 / 或 #")
     auto_parse_url: bool = Field(default=True, description="是否自动解析音乐链接")
     auto_parse_card: bool = Field(default=True, description="是否自动解析音乐卡片")
     search_limit: int = Field(default=5, description="搜索结果数量")
@@ -185,11 +186,12 @@ class MusicPlugin(MaiBotPlugin):
         Returns:
             格式化的选择文本。
         """
+        pfx = self.config.music.command_prefix
         lines = ["🎵 搜索结果："]
         for i, song in enumerate(results, 1):
             artist_part = f" - {song.artists}" if song.artists else ""
             lines.append(f"  {i}. {song.name}{artist_part}")
-        lines.append("使用 /选歌 <序号> 选择歌曲，如 /选歌 1")
+        lines.append(f"使用 {pfx}选歌 <序号> 选择歌曲，如 {pfx}选歌 1")
         return "\n".join(lines)
 
     async def _send_song(self, song: SongInfo, stream_id: str) -> bool:
@@ -350,13 +352,18 @@ class MusicPlugin(MaiBotPlugin):
     @Command(
         "点歌",
         description="点歌命令，搜索歌曲并列出选择",
-        pattern=r"^/点歌(?:\s+(?P<platform>163|qq|网易云音乐|网易|netease|qq音乐|qqmusic))?\s+(?P<query>.+)$",
+        pattern=r"^(?P<pfx>\S)点歌(?:\s+(?P<platform>163|qq|网易云音乐|网易|netease|qq音乐|qqmusic))?\s+(?P<query>.+)$",
     )
     async def handle_music_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
-        """处理 /点歌 命令。"""
+        """处理点歌命令。"""
         matched_groups = kwargs.get("matched_groups")
         if not isinstance(matched_groups, dict):
             matched_groups = {}
+
+        pfx = str(matched_groups.get("pfx", "") or "")
+        configured_pfx = self.config.music.command_prefix
+        if pfx and pfx != configured_pfx:
+            return False, "", False
 
         platform_hint = str(matched_groups.get("platform", "") or "").strip()
         query = str(matched_groups.get("query", "") or "").strip()
@@ -364,8 +371,9 @@ class MusicPlugin(MaiBotPlugin):
         # 如果 matched_groups 没有分组信息，尝试从原始消息解析
         if not query:
             raw_text = str(kwargs.get("text", "") or kwargs.get("message", "") or "")
+            epfx = re.escape(configured_pfx)
             match = re.match(
-                r"^/点歌(?:\s+(?P<platform>163|qq|网易云音乐|网易|netease|qq音乐|qqmusic))?\s+(?P<query>.+)$",
+                rf"^{epfx}点歌(?:\s+(?P<platform>163|qq|网易云音乐|网易|netease|qq音乐|qqmusic))?\s+(?P<query>.+)$",
                 raw_text,
                 re.DOTALL,
             )
@@ -374,7 +382,7 @@ class MusicPlugin(MaiBotPlugin):
                 query = match.group("query") or ""
 
         if not query:
-            await self.ctx.send.text("用法：/点歌 [163|qq] <歌曲名>", stream_id)
+            await self.ctx.send.text(f"用法：{configured_pfx}点歌 [163|qq] <歌曲名>", stream_id)
             return False, "缺少歌曲名", True
 
         success, message = await self._do_search_and_send(query, platform_hint, stream_id)
@@ -383,24 +391,30 @@ class MusicPlugin(MaiBotPlugin):
     @Command(
         "选歌",
         description="选择搜索结果中的歌曲",
-        pattern=r"^/选歌\s+(?P<index>\d+)$",
+        pattern=r"^(?P<pfx>\S)选歌\s+(?P<index>\d+)$",
     )
     async def handle_select_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
-        """处理 /选歌 命令。"""
+        """处理选歌命令。"""
         matched_groups = kwargs.get("matched_groups")
         if not isinstance(matched_groups, dict):
             matched_groups = {}
+
+        pfx = str(matched_groups.get("pfx", "") or "")
+        configured_pfx = self.config.music.command_prefix
+        if pfx and pfx != configured_pfx:
+            return False, "", False
 
         index_str = str(matched_groups.get("index", "") or "").strip()
 
         if not index_str:
             raw_text = str(kwargs.get("text", "") or kwargs.get("message", "") or "")
-            match = re.match(r"^/选歌\s+(?P<index>\d+)$", raw_text)
+            epfx = re.escape(configured_pfx)
+            match = re.match(rf"^{epfx}选歌\s+(?P<index>\d+)$", raw_text)
             if match:
                 index_str = match.group("index")
 
         if not index_str:
-            await self.ctx.send.text("用法：/选歌 <序号>", stream_id)
+            await self.ctx.send.text(f"用法：{configured_pfx}选歌 <序号>", stream_id)
             return False, "缺少序号", True
 
         # 查找待选状态
@@ -408,7 +422,7 @@ class MusicPlugin(MaiBotPlugin):
         async with self._pending_lock:
             pending = self._pending_choices.pop(stream_id, None)
             if pending is None:
-                await self.ctx.send.text("没有待选的歌曲，请先使用 /点歌 搜索", stream_id)
+                await self.ctx.send.text(f"没有待选的歌曲，请先使用 {configured_pfx}点歌 搜索", stream_id)
                 return False, "无待选歌曲", True
 
             results, _platform, _ts = pending

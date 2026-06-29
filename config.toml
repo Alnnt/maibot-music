@@ -1,9 +1,10 @@
 [plugin]
 enabled = true
-config_version = "1.1.1"
+config_version = "1.1.2"
 
 [music]
 default_platform = "163"
+command_prefix = "/"   # 命令前缀，如 / 或 #
 auto_parse_url = true
 auto_parse_card = true
 search_limit = 5

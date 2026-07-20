@@ -388,22 +388,30 @@ class MusicSearchClient:
 
     # ===== 获取音频 URL =====
 
-    async def get_song_url(self, song_id: str, platform: str, media_id: str = "") -> str | None:
+    async def get_song_url(
+        self,
+        song_id: str,
+        platform: str,
+        media_id: str = "",
+        *,
+        mp3_only: bool = False,
+    ) -> str | None:
         """获取歌曲的可播放音频 URL。
 
         Args:
             song_id: 歌曲ID。
             platform: 音乐平台，"163" 或 "qq"。
             media_id: QQ音乐的 strMediaMid（用于构造播放URL的filename）。
+            mp3_only: 是否只请求 MP3 音频，用于本地语音缓存。
 
         Returns:
             音频 URL，获取失败返回 None。
         """
         if platform == "qq":
-            return await self._get_qq_song_url(song_id, media_id)
-        return await self._get_netease_song_url(song_id)
+            return await self._get_qq_song_url(song_id, media_id, mp3_only=mp3_only)
+        return await self._get_netease_song_url(song_id, mp3_only=mp3_only)
 
-    async def _get_netease_song_url(self, song_id: str) -> str | None:
+    async def _get_netease_song_url(self, song_id: str, *, mp3_only: bool = False) -> str | None:
         """获取网易云音乐歌曲的播放 URL。
 
         依次尝试：
@@ -418,12 +426,13 @@ class MusicSearchClient:
             音频 URL，获取失败返回 None。
         """
         # 1. eapi 加密接口 — 对免费和付费歌曲都更友好
-        url = await self._get_netease_eapi_url(song_id)
+        bitrate = 320000 if mp3_only else 999000
+        url = await self._get_netease_eapi_url(song_id, bitrate)
         if url:
             return url
 
         # 2. 标准 Web 接口
-        url = await self._get_netease_web_url(song_id)
+        url = await self._get_netease_web_url(song_id, bitrate)
         if url:
             return url
 
@@ -434,7 +443,7 @@ class MusicSearchClient:
 
         return None
 
-    async def _get_netease_eapi_url(self, song_id: str) -> str | None:
+    async def _get_netease_eapi_url(self, song_id: str, bitrate: int) -> str | None:
         """通过 eapi 加密接口获取网易云歌曲播放 URL。
 
         eapi 是移动端接口，对付费/VIP 歌曲支持更好。
@@ -451,7 +460,7 @@ class MusicSearchClient:
 
         params: dict[str, Any] = {
             "ids": f"[{song_id}]",
-            "br": 999000,
+            "br": bitrate,
             "csrf_token": csrf_token,
         }
 
@@ -481,7 +490,7 @@ class MusicSearchClient:
 
         return None
 
-    async def _get_netease_web_url(self, song_id: str) -> str | None:
+    async def _get_netease_web_url(self, song_id: str, bitrate: int) -> str | None:
         """通过标准 Web 接口获取网易云歌曲播放 URL。
 
         Args:
@@ -490,7 +499,7 @@ class MusicSearchClient:
         Returns:
             音频 URL，获取失败返回 None。
         """
-        params: dict[str, str] = {"ids": f"[{song_id}]", "br": "999000"}
+        params: dict[str, str] = {"ids": f"[{song_id}]", "br": str(bitrate)}
         csrf_token = self._netease_cookie.get("__csrf", "")
         if csrf_token:
             params["csrf_token"] = csrf_token
@@ -543,7 +552,13 @@ class MusicSearchClient:
 
         return None
 
-    async def _get_qq_song_url(self, song_mid: str, media_mid: str = "") -> str | None:
+    async def _get_qq_song_url(
+        self,
+        song_mid: str,
+        media_mid: str = "",
+        *,
+        mp3_only: bool = False,
+    ) -> str | None:
         """获取QQ音乐歌曲的播放 URL。
 
         使用 vkey.GetVkeyServer 接口，一次性请求所有音质等级，
@@ -560,16 +575,17 @@ class MusicSearchClient:
         """
         if not media_mid:
             media_mid = song_mid
-        # 按音质从高到低构造 filename 列表：
-        # F000 = FLAC 无损, M800 = 320kbps MP3,
-        # M500 = 128kbps MP3, C400 = 96kbps M4A
-        # filename 格式: {prefix}{songmid}{mediaMid}{ext}
+        # 本地语音缓存要求 MP3；远程模式保留原有的全部音质候选。
         quality_prefixes = [
-            ("F000", ".flac"),
             ("M800", ".mp3"),
             ("M500", ".mp3"),
-            ("C400", ".m4a"),
         ]
+        if not mp3_only:
+            quality_prefixes = [
+                ("F000", ".flac"),
+                *quality_prefixes,
+                ("C400", ".m4a"),
+            ]
         filenames = [f"{prefix}{song_mid}{media_mid}{ext}" for prefix, ext in quality_prefixes]
         return await self._get_qq_vkey_batch(filenames, song_mid)
 

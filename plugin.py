@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 import time
-from typing import Any
+from typing import Any, Literal
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
@@ -26,7 +26,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.3.0", description="配置版本")
 
 
 class MusicConfig(PluginConfigBase):
@@ -47,6 +47,10 @@ class MusicConfig(PluginConfigBase):
     auto_select_first: bool = Field(
         default=False,
         description="搜索到多首歌曲时是否跳过选歌阶段，直接发送第一首",
+    )
+    play_mode: Literal["voice", "card"] = Field(
+        default="card",
+        description="播放模式: voice(语音音频) 或 card(音乐卡片)",
     )
 
 
@@ -198,8 +202,42 @@ class MusicPlugin(MaiBotPlugin):
         lines.append(f"使用 {pfx}选歌 <序号> 选择歌曲，如 {pfx}选歌 1")
         return "\n".join(lines)
 
+    async def _send_music_card(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
+        """以音乐卡片形式发送歌曲。
+
+        通过 NapCat 平台型 music 段发送，只需 song_id 和 platform，
+        NapCat 负责从音乐平台拉取音频和卡片展示信息。
+
+        Args:
+            song: SongInfo 对象。
+            stream_id: 目标消息流 ID。
+            silent: 是否静默处理失败（不向用户发送提示文本）。
+
+        Returns:
+            是否成功发送卡片。
+        """
+        try:
+            sent = await self.ctx.send.custom(
+                "music",
+                {"type": song.platform, "id": song.song_id},
+                stream_id,
+            )
+        except Exception:
+            self.ctx.logger.exception("发送音乐卡片失败: %s %s", song.platform, song.song_id)
+            if not silent:
+                await self.ctx.send.text(song.display(), stream_id)
+            return False
+
+        if sent:
+            return True
+
+        self.ctx.logger.warning("音乐卡片发送失败: %s %s", song.platform, song.song_id)
+        if not silent:
+            await self.ctx.send.text(song.display(), stream_id)
+        return False
+
     async def _send_song(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
-        """发送歌曲语音音频。
+        """发送歌曲语音音频或音乐卡片，根据 play_mode 配置分发。
 
         Args:
             song: SongInfo 对象。
@@ -209,8 +247,12 @@ class MusicPlugin(MaiBotPlugin):
                 失败时向用户发送提示。
 
         Returns:
-            是否成功发送音频。获取音频 URL 失败返回 False。
+            是否成功发送。获取音频 URL 失败返回 False。
         """
+        # 卡片模式：直接通过 NapCat music 段发送，无需获取音频 URL
+        if self.config.music.play_mode == "card":
+            return await self._send_music_card(song, stream_id, silent=silent)
+
         api = self._get_api()
 
         # QQ 音乐专辑曲目的 songmid 和 strMediaMid 通常不同，

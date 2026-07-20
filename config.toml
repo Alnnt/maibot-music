@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.2.0"
+config_version = "1.3.0"
 
 [music]
 default_platform = "163"
@@ -9,6 +9,7 @@ auto_parse_url = true
 auto_parse_card = true
 search_limit = 5
 auto_select_first = false   # 多首结果时跳过选歌阶段，直接发送第一首
+play_mode = "card"   # 播放模式: voice(语音音频) 或 card(音乐卡片)
 
 [netease]
 MUSIC_U = ""        # 登录凭证，用于获取高音质

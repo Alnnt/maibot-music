@@ -6,7 +6,7 @@ MaiBot 音乐插件，支持搜索点歌、解析音乐链接，发送语音音�
 
 - **搜索点歌**：通过关键词搜索歌曲，发送可播放的语音音频或音乐卡片
 - **双平台支持**：网易云音乐（163）和QQ音乐（qq）
-- **播放模式切换**：支持语音音频（voice）和音乐卡片（card）两种播放模式，可通过配置切换
+- **播放模式切换**：支持语音音频（voice）和音乐卡片（card）两种播放模式，可通过配置切换；音乐卡片仅支持网易云音乐
 - **命令触发**：使用 `/点歌` 命令快速点歌，前缀符号可自定义（如 `#点歌`）
 - **LLM 调用**：通过自然语言让 AI 帮你点歌
 - **链接解析**：自动识别消息中的音乐链接，发送语音音频
@@ -41,7 +41,7 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 | `music.auto_parse_card` | `true` | 是否自动解析音乐分享卡片（QQ音乐/网易云卡片和小程序） |
 | `music.search_limit` | `5` | 搜索结果数量 |
 | `music.auto_select_first` | `false` | 多首结果时跳过选歌阶段，直接发送第一首 |
-| `music.play_mode` | `"card"` | 播放模式：`voice`(语音音频) 或 `card`(音乐卡片) |
+| `music.play_mode` | `"card"` | 播放模式：`voice`(语音音频) 或 `card`(音乐卡片，仅支持网易云音乐) |
 | `music.voice_source` | `"local"` | voice 模式的音频来源：`local`(MaiBot 下载到共享缓存) 或 `remote`(NapCat 直接下载远程 URL) |
 | `music.cache_storage_dir` | `"/root/maimai/MaiBot/data/music_cache"` | MaiBot 写入音乐缓存的目录 |
 | `music.cache_napcat_dir` | `"/app/music_cache"` | 同一缓存目录在 NapCat 进程内的可见路径 |
@@ -74,7 +74,9 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 | 模式 | 说明 |
 |------|------|
 | `voice` | 插件获取音频 URL。默认由 MaiBot 下载 MP3 到共享缓存，NapCat 读取本地文件并上传为语音消息 |
-| `card` | 通过 NapCat 平台型 music 段发送音乐卡片，只需传入歌曲 ID，NapCat 负责解析音频和卡片展示。卡片可点击播放，音质取决于 NapCat 的解析能力 |
+| `card` | 通过 NapCat 平台型 music 段发送网易云音乐卡片，只需传入歌曲 ID，NapCat 负责解析音频和卡片展示。卡片可点击播放，音质取决于 NapCat 的解析能力。该模式仅支持网易云音乐 |
+
+> **注意：音乐卡片仅支持网易云音乐。** QQ 音乐卡片依赖外部音乐签名服务，可能因签名服务关闭 QQ 音乐 ID 解析而发送失败。需要播放 QQ 音乐时，请将 `music.play_mode` 设置为 `"voice"`。
 
 card 模式依赖 NapCat 适配器（已支持 `music` 出站段），不会下载或创建本地音乐缓存。
 

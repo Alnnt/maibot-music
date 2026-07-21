@@ -6,11 +6,12 @@ import asyncio
 import json
 import re
 import time
-from typing import Any
+from typing import Any, Literal
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
+from .audio_cache import AudioCacheError, MusicAudioCache
 from .music_api import MusicSearchClient, SongInfo
 from .url_parser import extract_urls, parse_music_card_text, parse_music_url
 
@@ -26,7 +27,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.4.0", description="配置版本")
 
 
 class MusicConfig(PluginConfigBase):
@@ -48,6 +49,27 @@ class MusicConfig(PluginConfigBase):
         default=False,
         description="搜索到多首歌曲时是否跳过选歌阶段，直接发送第一首",
     )
+    play_mode: Literal["voice", "card"] = Field(
+        default="card",
+        description="播放模式: voice(语音音频) 或 card(音乐卡片)",
+    )
+    voice_source: Literal["local", "remote"] = Field(
+        default="local",
+        description="语音音频来源: local(本地缓存) 或 remote(远程URL)",
+    )
+    cache_storage_dir: str = Field(
+        default="/root/maimai/MaiBot/data/music_cache",
+        description="MaiBot 保存音乐缓存的目录",
+    )
+    cache_napcat_dir: str = Field(
+        default="/app/music_cache",
+        description="NapCat 读取音乐缓存的目录",
+    )
+    cache_max_size_mb: int = Field(default=1024, gt=0, description="音乐缓存最大容量（MB）")
+    cache_expire_hours: int = Field(default=24, gt=0, description="超过此小时数未访问的缓存将被清理")
+    cache_cleanup_interval_hours: int = Field(default=24, gt=0, description="缓存清理任务执行间隔（小时）")
+    cache_max_file_size_mb: int = Field(default=50, gt=0, description="单个音乐缓存文件最大大小（MB）")
+    cache_download_timeout_seconds: int = Field(default=30, gt=0, description="下载音乐文件超时时间（秒）")
 
 
 class NeteaseConfig(PluginConfigBase):
@@ -92,8 +114,8 @@ class NapCatConfig(PluginConfigBase):
     __ui_order__ = 4
 
     http_url: str = Field(
-        default="http://127.0.0.1:3000",
-        description="NapCat HTTP API 地址（如 http://127.0.0.1:3000）",
+        default="http://127.0.0.1:9999",
+        description="NapCat HTTP API 地址（如 http://127.0.0.1:9999）",
     )
     http_token: str = Field(
         default="",
@@ -128,6 +150,11 @@ class MusicPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._api: MusicSearchClient | None = None
+        self._audio_cache: MusicAudioCache | None = None
+        self._cache_cleanup_task: asyncio.Task[None] | None = None
+        self._voice_send_condition = asyncio.Condition()
+        self._active_voice_sends = 0
+        self._stopping_audio_cache = False
         # key: stream_id（等于消息的 session_id）, value: (结果列表, 平台, 创建时间戳)
         self._pending_choices: dict[str, tuple[list[SongInfo], str, float]] = {}
         self._pending_lock = asyncio.Lock()
@@ -161,6 +188,84 @@ class MusicPlugin(MaiBotPlugin):
                 napcat_token=self.config.napcat.http_token,
             )
         return self._api
+
+    async def _start_audio_cache(self) -> None:
+        """按当前配置初始化语音音频缓存。"""
+        if self.config.music.play_mode != "voice" or self.config.music.voice_source != "local":
+            async with self._voice_send_condition:
+                self._stopping_audio_cache = False
+                self._voice_send_condition.notify_all()
+            return
+
+        async with self._voice_send_condition:
+            self._stopping_audio_cache = True
+
+        audio_cache = MusicAudioCache(
+            self.config.music.cache_storage_dir,
+            self.config.music.cache_napcat_dir,
+            max_size_bytes=self.config.music.cache_max_size_mb * 1024 * 1024,
+            expire_seconds=self.config.music.cache_expire_hours * 3600,
+            max_file_size_bytes=self.config.music.cache_max_file_size_mb * 1024 * 1024,
+            download_timeout_seconds=self.config.music.cache_download_timeout_seconds,
+        )
+        try:
+            await audio_cache.initialize()
+        except BaseException:
+            await audio_cache.close()
+            raise
+
+        self._audio_cache = audio_cache
+        self._cache_cleanup_task = asyncio.create_task(
+            self._cache_cleanup_loop(),
+            name="maibot-music-cache-cleanup",
+        )
+        async with self._voice_send_condition:
+            self._stopping_audio_cache = False
+            self._voice_send_condition.notify_all()
+
+    async def _stop_audio_cache(self) -> None:
+        """等待语音发送结束后停止缓存任务和下载客户端。"""
+        async with self._voice_send_condition:
+            self._stopping_audio_cache = True
+            await self._voice_send_condition.wait_for(lambda: self._active_voice_sends == 0)
+
+        if self._cache_cleanup_task is not None:
+            self._cache_cleanup_task.cancel()
+            try:
+                await self._cache_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cache_cleanup_task = None
+
+        if self._audio_cache is not None:
+            await self._audio_cache.close()
+            self._audio_cache = None
+
+    async def _acquire_voice_send(self) -> tuple[Literal["local", "remote"], MusicAudioCache | None]:
+        """注册一次语音发送并返回音频来源与缓存快照。"""
+        async with self._voice_send_condition:
+            await self._voice_send_condition.wait_for(lambda: not self._stopping_audio_cache)
+            self._active_voice_sends += 1
+            return self.config.music.voice_source, self._audio_cache
+
+    async def _release_voice_send(self) -> None:
+        """结束一次语音发送并唤醒等待中的缓存重载。"""
+        async with self._voice_send_condition:
+            self._active_voice_sends -= 1
+            if self._active_voice_sends == 0:
+                self._voice_send_condition.notify_all()
+
+    async def _cache_cleanup_loop(self) -> None:
+        """定期删除过期缓存并执行容量淘汰。"""
+        interval_seconds = self.config.music.cache_cleanup_interval_hours * 3600
+        while True:
+            await asyncio.sleep(interval_seconds)
+            if self._audio_cache is None:
+                continue
+            try:
+                await self._audio_cache.cleanup()
+            except Exception:
+                self.ctx.logger.exception("清理音乐缓存失败")
 
     def _resolve_platform(self, platform: str = "") -> str:
         """解析音乐平台，优先使用传入值，否则使用配置默认值。
@@ -198,69 +303,120 @@ class MusicPlugin(MaiBotPlugin):
         lines.append(f"使用 {pfx}选歌 <序号> 选择歌曲，如 {pfx}选歌 1")
         return "\n".join(lines)
 
-    async def _send_song(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
-        """发送歌曲语音音频。
+    async def _send_music_card(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
+        """以音乐卡片形式发送歌曲。
+
+        通过 NapCat 平台型 music 段发送，只需 song_id 和 platform，
+        NapCat 负责从音乐平台拉取音频和卡片展示信息。
 
         Args:
             song: SongInfo 对象。
             stream_id: 目标消息流 ID。
             silent: 是否静默处理失败（不向用户发送提示文本）。
-                Tool 换源重试时传 True 避免刷屏；Command/Hook 路径保持默认 False，
-                失败时向用户发送提示。
 
         Returns:
-            是否成功发送音频。获取音频 URL 失败返回 False。
+            是否成功发送卡片。
         """
-        api = self._get_api()
-
-        # QQ 音乐专辑曲目的 songmid 和 strMediaMid 通常不同，
-        # 如果 media_id 为空则通过详情接口补查，避免构造错误的播放 filename
-        media_id = song.media_id
-        if song.platform == "qq" and not media_id:
-            try:
-                detail = await api.get_qq_song_detail(song.song_id)
-                if detail:
-                    media_id = detail.media_id
-            except Exception:
-                self.ctx.logger.debug("QQ音乐详情查询失败: %s", song.song_id)
-
         try:
-            audio_url = await api.get_song_url(song.song_id, song.platform, media_id)
-        except Exception:
-            self.ctx.logger.exception("获取音频URL异常: %s", song.song_id)
-            return False
-
-        if not audio_url:
-            self.ctx.logger.info("未获取到音频URL: %s %s", song.platform, song.song_id)
-            if not silent:
-                await self.ctx.send.text(
-                    f"找到「{song.display()}」但无法获取音频，可能因版权限制",
-                    stream_id,
-                )
-            return False
-
-        try:
-            await self.ctx.send.custom(
-                "voiceurl",
-                {"url": audio_url},
+            sent = await self.ctx.send.custom(
+                "music",
+                {"type": song.platform, "id": song.song_id},
                 stream_id,
             )
         except Exception:
-            self.ctx.logger.exception("发送语音音频失败: %s", audio_url)
+            self.ctx.logger.exception("发送音乐卡片失败: %s %s", song.platform, song.song_id)
             if not silent:
                 await self.ctx.send.text(song.display(), stream_id)
             return False
 
-        return True
+        if sent:
+            return True
+
+        self.ctx.logger.warning("音乐卡片发送失败: %s %s", song.platform, song.song_id)
+        if not silent:
+            await self.ctx.send.text(song.display(), stream_id)
+        return False
+
+    async def _send_voice_audio(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
+        """获取歌曲音频并以语音消息发送。"""
+        voice_source, audio_cache = await self._acquire_voice_send()
+        cache_path = None
+        try:
+            api = self._get_api()
+
+            # QQ 音乐专辑曲目的 songmid 和 strMediaMid 通常不同，
+            # 如果 media_id 为空则通过详情接口补查，避免构造错误的播放 filename
+            media_id = song.media_id
+            if song.platform == "qq" and not media_id:
+                detail = await api.get_qq_song_detail(song.song_id)
+                if detail:
+                    media_id = detail.media_id
+
+            audio_url = await api.get_song_url(
+                song.song_id,
+                song.platform,
+                media_id,
+                mp3_only=voice_source == "local",
+            )
+            if not audio_url:
+                self.ctx.logger.info("未获取到音频URL: %s %s", song.platform, song.song_id)
+                if not silent:
+                    await self.ctx.send.text(
+                        f"找到「{song.display()}」但无法获取音频，可能因版权限制",
+                        stream_id,
+                    )
+                return False
+
+            voice_reference = audio_url
+            if voice_source == "local":
+                if audio_cache is None:
+                    raise RuntimeError("本地音乐缓存尚未初始化")
+                cache_path = await audio_cache.get_or_download(song.platform, song.song_id, audio_url)
+                voice_reference = audio_cache.napcat_path(cache_path)
+
+            sent = await self.ctx.send.custom(
+                "voiceurl",
+                {"url": voice_reference},
+                stream_id,
+            )
+            if sent:
+                return True
+
+            self.ctx.logger.warning("发送语音音频失败: %s", voice_reference)
+            if not silent:
+                await self.ctx.send.text(song.display(), stream_id)
+            return False
+        finally:
+            if cache_path is not None and audio_cache is not None:
+                await audio_cache.release(cache_path)
+            await self._release_voice_send()
+
+    async def _send_song(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
+        """发送歌曲语音音频或音乐卡片，根据 play_mode 配置分发。"""
+        if self.config.music.play_mode == "card":
+            return await self._send_music_card(song, stream_id, silent=silent)
+
+        try:
+            return await self._send_voice_audio(song, stream_id, silent=silent)
+        except AudioCacheError as exc:
+            self.ctx.logger.warning("缓存音乐音频失败: %s %s: %s", song.platform, song.song_id, exc)
+        except Exception:
+            self.ctx.logger.exception("发送语音音频异常: %s %s", song.platform, song.song_id)
+
+        if not silent:
+            await self.ctx.send.text(f"「{song.display()}」的语音音频发送失败", stream_id)
+        return False
 
     # ===== 生命周期 =====
 
     async def on_load(self) -> None:
-        """插件加载。"""
+        """插件加载，初始化本地音乐缓存。"""
+        await self._start_audio_cache()
         self.ctx.logger.info("音乐插件已加载")
 
     async def on_unload(self) -> None:
-        """插件卸载，关闭 HTTP 客户端。"""
+        """插件卸载，关闭 HTTP 客户端和缓存任务。"""
+        await self._stop_audio_cache()
         if self._api is not None:
             await self._api.close()
             self._api = None
@@ -268,11 +424,17 @@ class MusicPlugin(MaiBotPlugin):
         self.ctx.logger.info("音乐插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
-        """配置热重载 — 重置 API 客户端以应用新 Cookie。"""
+        """配置热重载，重建 API 客户端和本地音乐缓存。"""
+        del config_data, version
+        if scope != "self":
+            return
+
+        await self._stop_audio_cache()
         if self._api is not None:
             await self._api.close()
             self._api = None
-        self.ctx.logger.info("音乐插件配置已更新，API 客户端已重置")
+        await self._start_audio_cache()
+        self.ctx.logger.info("音乐插件配置已更新，API 客户端和音乐缓存已重置")
 
     # ===== 搜索核心逻辑 =====
 

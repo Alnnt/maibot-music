@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.2.0"
+config_version = "1.4.0"
 
 [music]
 default_platform = "163"
@@ -9,6 +9,15 @@ auto_parse_url = true
 auto_parse_card = true
 search_limit = 5
 auto_select_first = false   # 多首结果时跳过选歌阶段，直接发送第一首
+play_mode = "card"   # 播放模式: voice(语音音频) 或 card(音乐卡片)
+voice_source = "local"   # 语音来源: local(本地缓存) 或 remote(远程URL)
+cache_storage_dir = "/root/maimai/MaiBot/data/music_cache"   # MaiBot 写入目录
+cache_napcat_dir = "/app/music_cache"   # NapCat 进程可见的读取目录
+cache_max_size_mb = 1024
+cache_expire_hours = 24
+cache_cleanup_interval_hours = 24
+cache_max_file_size_mb = 50
+cache_download_timeout_seconds = 30
 
 [netease]
 MUSIC_U = ""        # 登录凭证，用于获取高音质

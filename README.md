@@ -4,8 +4,9 @@ MaiBot 音乐插件，支持搜索点歌、解析音乐链接，发送语音音�
 
 ## 功能
 
-- **搜索点歌**：通过关键词搜索歌曲，发送可播放的语音音频
+- **搜索点歌**：通过关键词搜索歌曲，发送可播放的语音音频或音乐卡片
 - **双平台支持**：网易云音乐（163）和QQ音乐（qq）
+- **播放模式切换**：支持语音音频（voice）和音乐卡片（card）两种播放模式，可通过配置切换；音乐卡片仅支持网易云音乐
 - **命令触发**：使用 `/点歌` 命令快速点歌，前缀符号可自定义（如 `#点歌`）
 - **LLM 调用**：通过自然语言让 AI 帮你点歌
 - **链接解析**：自动识别消息中的音乐链接，发送语音音频
@@ -33,18 +34,27 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `plugin.enabled` | `false` | 是否启用插件 |
+| `plugin.enabled` | `true` | 是否启用插件 |
 | `music.default_platform` | `"163"` | 默认音乐平台：`163`(网易云) 或 `qq`(QQ音乐) |
 | `music.command_prefix` | `"/"` | 命令前缀符号，如 `/` 或 `#` |
 | `music.auto_parse_url` | `true` | 是否自动解析消息中的音乐链接 |
-| `music.auto_parse_card` | `false` | 是否自动解析音乐分享卡片（QQ音乐/网易云卡片和小程序） |
+| `music.auto_parse_card` | `true` | 是否自动解析音乐分享卡片（QQ音乐/网易云卡片和小程序） |
 | `music.search_limit` | `5` | 搜索结果数量 |
 | `music.auto_select_first` | `false` | 多首结果时跳过选歌阶段，直接发送第一首 |
+| `music.play_mode` | `"card"` | 播放模式：`voice`(语音音频) 或 `card`(音乐卡片，仅支持网易云音乐) |
+| `music.voice_source` | `"local"` | voice 模式的音频来源：`local`(MaiBot 下载到共享缓存) 或 `remote`(NapCat 直接下载远程 URL) |
+| `music.cache_storage_dir` | `"/root/maimai/MaiBot/data/music_cache"` | MaiBot 写入音乐缓存的目录 |
+| `music.cache_napcat_dir` | `"/app/music_cache"` | 同一缓存目录在 NapCat 进程内的可见路径 |
+| `music.cache_max_size_mb` | `1024` | 缓存容量上限，超出后按最久未使用顺序淘汰 |
+| `music.cache_expire_hours` | `24` | 删除超过此时间未使用的缓存 |
+| `music.cache_cleanup_interval_hours` | `24` | 过期缓存清理间隔 |
+| `music.cache_max_file_size_mb` | `50` | 单个 MP3 的下载大小上限 |
+| `music.cache_download_timeout_seconds` | `30` | MaiBot 下载 MP3 的超时时间 |
 | `netease.MUSIC_U` | `""` | 网易云 `MUSIC_U`（用于高音质/付费歌曲） |
 | `netease.csrf_token` | `""` | 网易云 `__csrf`（与 MUSIC_U 配对） |
 | `qq.uin` | `""` | QQ音乐 `uin`（QQ 号） |
 | `qq.qqmusic_key` | `""` | QQ音乐 `qqmusic_key`（用于高音质） |
-| `napcat.http_url` | `"http://127.0.0.1:3000"` | NapCat HTTP API 地址（用于解析音乐卡片原始数据） |
+| `napcat.http_url` | `"http://127.0.0.1:9999"` | NapCat HTTP API 地址（用于解析音乐卡片原始数据） |
 | `napcat.http_token` | `""` | NapCat 访问令牌（留空则不鉴权） |
 
 ### Cookie 获取方法
@@ -56,6 +66,38 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 ##### 当前QQ音乐的专辑内歌曲解析还没有实现，非专辑的可以正常解析
 
 ##### 不配置 Cookie 时，插件以匿名态请求 API，通常只能获取非v非专的歌。
+
+### 播放模式
+
+`music.play_mode` 控制歌曲以何种形式发送：
+
+| 模式 | 说明 |
+|------|------|
+| `voice` | 插件获取音频 URL。默认由 MaiBot 下载 MP3 到共享缓存，NapCat 读取本地文件并上传为语音消息 |
+| `card` | 通过 NapCat 平台型 music 段发送网易云音乐卡片，只需传入歌曲 ID，NapCat 负责解析音频和卡片展示。卡片可点击播放，音质取决于 NapCat 的解析能力。该模式仅支持网易云音乐 |
+
+> **注意：音乐卡片仅支持网易云音乐。** QQ 音乐卡片依赖外部音乐签名服务，可能因签名服务关闭 QQ 音乐 ID 解析而发送失败。需要播放 QQ 音乐时，请将 `music.play_mode` 设置为 `"voice"`。
+
+card 模式依赖 NapCat 适配器（已支持 `music` 出站段），不会下载或创建本地音乐缓存。
+
+### Voice 本地缓存
+
+`music.play_mode = "voice"` 且 `music.voice_source = "local"` 时，MaiBot 会先下载真实 MP3 到 `cache_storage_dir`，再将 `cache_napcat_dir` 下的对应路径发送给 NapCat。缓存命中会刷新使用时间；缓存超过 1GB 时立即按最久未使用顺序淘汰，并每 24 小时清理超过 24 小时未使用的文件。
+
+MaiBot 和 NapCat 必须能读取同一份缓存文件：
+
+- **同机非 Docker**：将 `cache_storage_dir` 和 `cache_napcat_dir` 配置为同一个绝对路径。
+- **NapCat 使用 Docker**：给 NapCat 服务增加只读 volume：
+
+```yaml
+volumes:
+  - /root/maimai/MaiBot/data/music_cache:/app/music_cache:ro
+```
+
+- **MaiBot 和 NapCat 都使用 Docker**：两个服务挂载同一个宿主机目录；MaiBot 挂载为可写，NapCat 挂载为只读。
+- **远程 NapCat**：本地路径无法跨主机读取，应将 `music.voice_source` 改为 `"remote"`，或使用共享文件系统。
+
+本地缓存只接受经过格式校验的 MP3，不会将 FLAC/M4A 内容改名为 `.mp3`。
 
 **网易云音乐：**
 1. 在浏览器中登录 [music.163.com](https://music.163.com/)
@@ -100,7 +142,7 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 - **搜索无结果**：检查网络连接，部分 API 可能需要代理
 - **语音音频未发送**：部分歌曲因版权限制无法获取音频 URL
 - **链接未被识别**：确认链接格式与上述支持的格式一致
-- **音乐卡片未被解析**：确认 NapCat 开启了 HTTP API，且 `napcat.http_url` 配置正确。NapCat 默认 HTTP 端口为 3000
+- **音乐卡片未被解析**：确认 NapCat 开启了 HTTP API，且 `napcat.http_url` 配置正确。当前配置模板使用端口 9999
 
 ## 安全说明
 

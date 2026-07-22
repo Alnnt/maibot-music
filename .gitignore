@@ -6,3 +6,4 @@ data/
 *.log
 .venv/
 config_back/
+config.toml

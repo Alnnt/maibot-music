@@ -27,7 +27,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.4.0", description="配置版本")
+    config_version: str = Field(default="1.4.1", description="配置版本")
 
 
 class MusicConfig(PluginConfigBase):
@@ -362,7 +362,7 @@ class MusicPlugin(MaiBotPlugin):
                 self.ctx.logger.info("未获取到音频URL: %s %s", song.platform, song.song_id)
                 if not silent:
                     await self.ctx.send.text(
-                        f"找到「{song.display()}」但无法获取音频，可能因版权限制",
+                        f"找到「{song.display()}」但音乐平台未返回可用音频",
                         stream_id,
                     )
                 return False
@@ -382,7 +382,12 @@ class MusicPlugin(MaiBotPlugin):
             if sent:
                 return True
 
-            self.ctx.logger.warning("发送语音音频失败: %s", voice_reference)
+            self.ctx.logger.warning(
+                "发送语音音频失败: platform=%s song_id=%s source=%s",
+                song.platform,
+                song.song_id,
+                voice_source,
+            )
             if not silent:
                 await self.ctx.send.text(song.display(), stream_id)
             return False
@@ -547,8 +552,8 @@ class MusicPlugin(MaiBotPlugin):
         return {
             "name": _TOOL_NAME,
             "content": (
-                f"已尝试在网易云音乐和QQ音乐搜索「{query}」，所有结果均无法获取音频，"
-                "可能因版权限制。请不要重复调用本工具，直接告知用户无法播放即可。"
+                f"已尝试在网易云音乐和QQ音乐搜索「{query}」，音乐平台均未返回可用音频。"
+                "请不要重复调用本工具，直接告知用户当前无法播放即可。"
             ),
         }
 

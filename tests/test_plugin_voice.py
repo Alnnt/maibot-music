@@ -5,7 +5,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -34,6 +34,17 @@ _load_module("url_parser", "url_parser.py")
 plugin_module = _load_module("plugin", "plugin.py")
 MusicPlugin = plugin_module.MusicPlugin
 SongInfo = music_api.SongInfo
+
+
+class FakeResponse:
+    def __init__(self, data: object) -> None:
+        self._data = data
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> object:
+        return self._data
 
 
 class FakeAudioCache:
@@ -96,6 +107,154 @@ async def test_send_voice_audio_uses_napcat_local_path(tmp_path: Path) -> None:
         mp3_only=True,
     )
     assert plugin._audio_cache.released_path == tmp_path / "163_123.mp3"
+
+
+@pytest.mark.asyncio
+async def test_qq_voice_uses_media_mid_from_song_detail() -> None:
+    plugin = object.__new__(MusicPlugin)
+    plugin._audio_cache = None
+    plugin._voice_send_condition = asyncio.Condition()
+    plugin._active_voice_sends = 0
+    plugin._stopping_audio_cache = False
+    plugin._plugin_config_instance = types.SimpleNamespace(
+        music=types.SimpleNamespace(voice_source="remote"),
+    )
+    logger = types.SimpleNamespace(info=lambda *args: None, warning=Mock())
+    plugin._ctx = types.SimpleNamespace(
+        send=types.SimpleNamespace(custom=AsyncMock(return_value=False)),
+        logger=logger,
+    )
+    detail = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="测试专辑",
+        platform="qq",
+        media_id="different-media-mid",
+    )
+    api = types.SimpleNamespace(
+        get_qq_song_detail=AsyncMock(return_value=detail),
+        get_song_url=AsyncMock(return_value="https://example.test/song.mp3?vkey=secret"),
+    )
+    plugin._get_api = lambda: api
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="测试专辑",
+        platform="qq",
+    )
+
+    sent = await plugin._send_voice_audio(song, "stream-1", silent=True)
+
+    assert sent is False
+    api.get_qq_song_detail.assert_awaited_once_with("song-mid")
+    api.get_song_url.assert_awaited_once_with(
+        "song-mid",
+        "qq",
+        "different-media-mid",
+        mp3_only=False,
+    )
+    warning_args = logger.warning.call_args.args
+    assert "secret" not in " ".join(str(arg) for arg in warning_args)
+
+
+@pytest.mark.asyncio
+async def test_qq_voice_resolves_media_mid_through_vkey_request() -> None:
+    plugin = object.__new__(MusicPlugin)
+    plugin._audio_cache = None
+    plugin._voice_send_condition = asyncio.Condition()
+    plugin._active_voice_sends = 0
+    plugin._stopping_audio_cache = False
+    plugin._plugin_config_instance = types.SimpleNamespace(
+        music=types.SimpleNamespace(voice_source="remote"),
+    )
+    plugin._ctx = types.SimpleNamespace(
+        send=types.SimpleNamespace(custom=AsyncMock(return_value=True)),
+        logger=types.SimpleNamespace(info=Mock(), warning=Mock()),
+    )
+    api = object.__new__(music_api.MusicSearchClient)
+    api._qq_cookie = {}
+    api._qq_client = types.SimpleNamespace(
+        post=AsyncMock(
+            side_effect=[
+                FakeResponse(
+                    {
+                        "code": 0,
+                        "req_0": {
+                            "code": 0,
+                            "data": {
+                                "track_info": {
+                                    "mid": "song-mid",
+                                    "name": "测试歌曲",
+                                    "singer": [{"name": "测试歌手"}],
+                                    "album": {"name": "测试专辑"},
+                                    "file": {"media_mid": "different-media-mid"},
+                                }
+                            },
+                        },
+                    }
+                ),
+                FakeResponse(
+                    {
+                        "code": 0,
+                        "req_0": {
+                            "code": 0,
+                            "data": {
+                                "sip": ["https://example.test/"],
+                                "midurlinfo": [
+                                    {
+                                        "filename": "F000different-media-mid.flac",
+                                        "purl": "audio/test.flac",
+                                        "result": 0,
+                                    },
+                                    {
+                                        "filename": "M800different-media-mid.mp3",
+                                        "purl": "",
+                                        "result": 0,
+                                    },
+                                    {
+                                        "filename": "M500different-media-mid.mp3",
+                                        "purl": "",
+                                        "result": 0,
+                                    },
+                                    {
+                                        "filename": "C400different-media-mid.m4a",
+                                        "purl": "",
+                                        "result": 0,
+                                    },
+                                ],
+                            },
+                        },
+                    }
+                ),
+            ]
+        )
+    )
+    plugin._get_api = lambda: api
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="测试专辑",
+        platform="qq",
+    )
+
+    sent = await plugin._send_voice_audio(song, "stream-1", silent=True)
+
+    assert sent is True
+    vkey_request = api._qq_client.post.await_args_list[1].kwargs["json"]
+    assert vkey_request["req_0"]["param"]["filename"] == [
+        "F000different-media-mid.flac",
+        "M800different-media-mid.mp3",
+        "M500different-media-mid.mp3",
+        "C400different-media-mid.m4a",
+    ]
+    plugin.ctx.send.custom.assert_awaited_once_with(
+        "voiceurl",
+        {"url": "https://example.test/audio/test.flac"},
+        "stream-1",
+    )
 
 
 @pytest.mark.asyncio

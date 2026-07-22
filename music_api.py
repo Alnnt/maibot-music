@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
 import hashlib
 import json
 import logging
 import re
 import secrets
-from dataclasses import dataclass
-from typing import Any
 
-import httpx
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import httpx
 
 logger = logging.getLogger("maibot-music.api")
 
@@ -38,6 +40,10 @@ _QQ_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://y.qq.com/",
 }
+
+
+class MusicAPIResponseError(RuntimeError):
+    """音乐平台返回的响应不符合预期协议。"""
 
 
 @dataclass
@@ -204,29 +210,67 @@ class MusicSearchClient:
                 params={"s": query, "type": "1", "limit": str(limit), "offset": "0"},
             )
             resp.raise_for_status()
-            data = resp.json()
         except httpx.TimeoutException:
             logger.warning("网易云音乐搜索超时: %s", query)
             return []
         except httpx.HTTPStatusError as e:
             logger.warning("网易云音乐搜索请求失败: %s %s", e.response.status_code, query)
             return []
-        except Exception:
-            logger.exception("网易云音乐搜索异常: %s", query)
+        except httpx.RequestError:
+            logger.exception("网易云音乐搜索网络异常: %s", query)
             return []
 
-        songs = data.get("result", {}).get("songs", [])
+        try:
+            data = resp.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise MusicAPIResponseError(f"网易云音乐搜索响应不是有效 JSON: query={query!r}") from exc
+
+        if not isinstance(data, dict):
+            raise MusicAPIResponseError(
+                f"网易云音乐搜索响应不是对象: query={query!r} type={type(data).__name__}"
+            )
+
+        code = data.get("code")
+        if code != 200:
+            raise MusicAPIResponseError(f"网易云音乐搜索业务失败: query={query!r} code={code!r}")
+
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise MusicAPIResponseError(
+                "网易云音乐搜索响应格式错误: "
+                f"query={query!r} result_type={type(result).__name__}"
+            )
+
+        songs = result.get("songs", [])
+        if not isinstance(songs, list):
+            raise MusicAPIResponseError(
+                "网易云音乐搜索 songs 不是列表: "
+                f"query={query!r} type={type(songs).__name__}"
+            )
         if not songs:
             return []
 
         results: list[SongInfo] = []
         for song in songs:
+            if not isinstance(song, dict):
+                raise MusicAPIResponseError(
+                    "网易云音乐搜索歌曲项不是对象: "
+                    f"query={query!r} type={type(song).__name__}"
+                )
+
+            artists_data = song.get("artists", [])
+            album_data = song.get("album", {})
+            if not isinstance(artists_data, list) or not isinstance(album_data, dict):
+                raise MusicAPIResponseError(f"网易云音乐搜索歌曲字段格式错误: query={query!r}")
+
             song_id = str(song.get("id", ""))
             name = str(song.get("name", ""))
             artists = ", ".join(
-                artist.get("name", "") for artist in song.get("artists", []) if artist.get("name")
+                str(artist.get("name", ""))
+                for artist in artists_data
+                if isinstance(artist, dict) and artist.get("name")
             )
-            album = str(song.get("album", {}).get("name", ""))
+            album = str(album_data.get("name", ""))
             if song_id and name:
                 results.append(
                     SongInfo(
@@ -276,39 +320,78 @@ class MusicSearchClient:
                 json=req_data,
             )
             resp.raise_for_status()
-            data = resp.json()
-        except httpx.TimeoutException:
-            logger.warning("QQ音乐搜索超时: %s", query)
-            return []
-        except httpx.HTTPStatusError as e:
-            logger.warning("QQ音乐搜索请求失败: %s %s", e.response.status_code, query)
-            return []
-        except Exception:
-            logger.exception("QQ音乐搜索异常: %s", query)
-            return []
+        except httpx.TimeoutException as exc:
+            raise MusicAPIResponseError(f"QQ音乐搜索超时: query={query!r}") from exc
+        except httpx.HTTPStatusError as exc:
+            raise MusicAPIResponseError(
+                f"QQ音乐搜索请求失败: query={query!r} status={exc.response.status_code}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise MusicAPIResponseError(f"QQ音乐搜索网络异常: query={query!r}") from exc
 
         try:
-            body = data["req_1"]["data"]["body"]
-            song_list = body["song"]["list"]
-        except (KeyError, IndexError, TypeError):
-            logger.debug("QQ音乐搜索响应解析失败: %s", query)
-            return []
+            data = resp.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise MusicAPIResponseError(f"QQ音乐搜索响应不是有效 JSON: query={query!r}") from exc
+
+        if not isinstance(data, dict):
+            raise MusicAPIResponseError(
+                f"QQ音乐搜索响应不是对象: query={query!r} type={type(data).__name__}"
+            )
+
+        req_result = data.get("req_1")
+        if not isinstance(req_result, dict):
+            raise MusicAPIResponseError(f"QQ音乐搜索响应缺少 req_1: query={query!r}")
+
+        top_code = data.get("code")
+        module_code = req_result.get("code")
+        if top_code not in (None, 0) or module_code not in (None, 0):
+            raise MusicAPIResponseError(
+                "QQ音乐搜索业务失败: "
+                f"query={query!r} code={top_code!r} module_code={module_code!r}"
+            )
+
+        result_data = req_result.get("data")
+        body = result_data.get("body") if isinstance(result_data, dict) else None
+        song_data = body.get("song") if isinstance(body, dict) else None
+        song_list = song_data.get("list") if isinstance(song_data, dict) else None
+        if not isinstance(song_list, list):
+            raise MusicAPIResponseError(
+                f"QQ音乐搜索响应歌曲列表格式错误: query={query!r} type={type(song_list).__name__}"
+            )
 
         if not song_list:
             return []
 
         results: list[SongInfo] = []
         for song in song_list:
+            if not isinstance(song, dict):
+                raise MusicAPIResponseError(
+                    f"QQ音乐搜索歌曲项不是对象: query={query!r} type={type(song).__name__}"
+                )
+
+            singers = song.get("singer", [])
+            album_data = song.get("album", {})
+            file_data = song.get("file", {})
+            if (
+                not isinstance(singers, list)
+                or not isinstance(album_data, dict)
+                or not isinstance(file_data, dict)
+            ):
+                raise MusicAPIResponseError(f"QQ音乐搜索歌曲字段格式错误: query={query!r}")
+
             song_mid = str(song.get("mid", "") or song.get("songmid", ""))
             name = str(song.get("name", "") or song.get("songname", ""))
-            singers = song.get("singer", [])
-            artists = ", ".join(s.get("name", "") for s in singers if s.get("name"))
-            album = str(song.get("album", {}).get("name", "") or song.get("albumname", ""))
+            artists = ", ".join(
+                str(singer.get("name", ""))
+                for singer in singers
+                if isinstance(singer, dict) and singer.get("name")
+            )
+            album = str(album_data.get("name", "") or song.get("albumname", ""))
             media_mid = str(
-                song.get("file", {}).get("media_mid", "")
+                file_data.get("media_mid", "")
                 or song.get("strMediaMid", "")
                 or song.get("media_mid", "")
-                or song_mid
             )
             if song_mid and name:
                 results.append(
@@ -353,26 +436,65 @@ class MusicSearchClient:
                 json=req_data,
             )
             resp.raise_for_status()
-            data = resp.json()
-        except httpx.TimeoutException:
-            logger.warning("QQ音乐歌曲详情查询超时: %s", song_mid)
-            return None
-        except Exception:
-            logger.exception("QQ音乐歌曲详情查询异常: %s", song_mid)
-            return None
+        except httpx.TimeoutException as exc:
+            raise MusicAPIResponseError(f"QQ音乐歌曲详情查询超时: song_mid={song_mid}") from exc
+        except httpx.HTTPStatusError as exc:
+            raise MusicAPIResponseError(
+                f"QQ音乐歌曲详情请求失败: song_mid={song_mid} status={exc.response.status_code}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise MusicAPIResponseError(f"QQ音乐歌曲详情网络异常: song_mid={song_mid}") from exc
 
         try:
-            track = data["req_0"]["data"]["track_info"]
-        except (KeyError, IndexError, TypeError):
-            logger.debug("QQ音乐歌曲详情解析失败: %s", song_mid)
-            return None
+            data = resp.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise MusicAPIResponseError(
+                f"QQ音乐歌曲详情响应不是有效 JSON: song_mid={song_mid}"
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise MusicAPIResponseError(
+                f"QQ音乐歌曲详情响应不是对象: song_mid={song_mid} type={type(data).__name__}"
+            )
+
+        req_result = data.get("req_0")
+        if not isinstance(req_result, dict):
+            raise MusicAPIResponseError(f"QQ音乐歌曲详情响应缺少 req_0: song_mid={song_mid}")
+
+        top_code = data.get("code")
+        module_code = req_result.get("code")
+        if top_code not in (None, 0) or module_code not in (None, 0):
+            raise MusicAPIResponseError(
+                "QQ音乐歌曲详情业务失败: "
+                f"song_mid={song_mid} code={top_code!r} module_code={module_code!r}"
+            )
+
+        result_data = req_result.get("data")
+        track = result_data.get("track_info") if isinstance(result_data, dict) else None
+        if not isinstance(track, dict):
+            raise MusicAPIResponseError(
+                f"QQ音乐歌曲详情 track_info 不是对象: song_mid={song_mid} type={type(track).__name__}"
+            )
+
+        singers = track.get("singer", [])
+        album_data = track.get("album", {})
+        file_data = track.get("file", {})
+        if (
+            not isinstance(singers, list)
+            or not isinstance(album_data, dict)
+            or not isinstance(file_data, dict)
+        ):
+            raise MusicAPIResponseError(f"QQ音乐歌曲详情字段格式错误: song_mid={song_mid}")
 
         mid = str(track.get("mid", "") or song_mid)
         name = str(track.get("name", ""))
-        singers = track.get("singer", [])
-        artists = ", ".join(s.get("name", "") for s in singers if s.get("name"))
-        album = str(track.get("album", {}).get("name", ""))
-        media_mid = str(track.get("file", {}).get("media_mid", "") or mid)
+        artists = ", ".join(
+            str(singer.get("name", ""))
+            for singer in singers
+            if isinstance(singer, dict) and singer.get("name")
+        )
+        album = str(album_data.get("name", ""))
+        media_mid = str(file_data.get("media_mid", ""))
 
         if not mid or not name:
             return None
@@ -544,7 +666,11 @@ class MusicSearchClient:
                 follow_redirects=True,
             )
             final_url = str(resp.url)
-            logger.debug("网易云直链重定向: song_id=%s final_url=%s", song_id, final_url)
+            logger.debug(
+                "网易云直链重定向: song_id=%s host=%s",
+                song_id,
+                urlparse(final_url).hostname or "",
+            )
             if final_url and any(ext in final_url for ext in (".mp3", ".flac", ".m4a", ".wav", ".ogg", ".aac")):
                 return final_url
         except Exception:
@@ -573,9 +699,8 @@ class MusicSearchClient:
         Returns:
             音频 URL，获取失败返回 None。
         """
-        if not media_mid:
-            media_mid = song_mid
-        # 本地语音缓存要求 MP3；远程模式保留原有的全部音质候选。
+        resource_mid = media_mid or song_mid
+        # QQ 音频文件名使用资源 media_mid；songmid 仅作为 vkey 请求中的歌曲标识。
         quality_prefixes = [
             ("M800", ".mp3"),
             ("M500", ".mp3"),
@@ -586,7 +711,7 @@ class MusicSearchClient:
                 *quality_prefixes,
                 ("C400", ".m4a"),
             ]
-        filenames = [f"{prefix}{song_mid}{media_mid}{ext}" for prefix, ext in quality_prefixes]
+        filenames = [f"{prefix}{resource_mid}{ext}" for prefix, ext in quality_prefixes]
         return await self._get_qq_vkey_batch(filenames, song_mid)
 
     async def _get_qq_vkey_batch(self, filenames: list[str], song_mid: str) -> str | None:
@@ -601,10 +726,9 @@ class MusicSearchClient:
         """
         guid = str(secrets.randbelow(9000000000) + 1000000000)
 
-        # 从配置获取登录态
+        # 从配置获取登录态。CgiGetVkey 在匿名请求中同样要求 loginflag=1。
         uin = self._qq_cookie.get("uin", "0")
         qqmusic_key = self._qq_cookie.get("qqmusic_key", "")
-        loginflag = 1 if uin != "0" else 0
 
         # 一次请求发送所有音质 filename，songmid 也对应扩展
         req_data = {
@@ -617,7 +741,7 @@ class MusicSearchClient:
                     "songmid": [song_mid] * len(filenames),
                     "songtype": [0] * len(filenames),
                     "uin": uin,
-                    "loginflag": loginflag,
+                    "loginflag": 1,
                     "platform": "20",
                 },
             },
@@ -645,28 +769,99 @@ class MusicSearchClient:
             logger.exception("QQ音乐获取vkey异常: %s", song_mid)
             return None
 
-        try:
-            sip = data["req_0"]["data"]["sip"]
-            midurlinfo = data["req_0"]["data"]["midurlinfo"]
-        except (KeyError, IndexError):
-            logger.debug("QQ音乐vkey响应解析失败: %s", song_mid)
+        if not isinstance(data, dict):
+            logger.warning("QQ音乐vkey响应不是对象: song_mid=%s type=%s", song_mid, type(data).__name__)
             return None
 
-        # 选择非 ws.stream 的域名（优先 HTTPS）
-        domain = ""
-        for s in sip:
-            if s.startswith("https://"):
-                domain = s
-                break
-        if not domain and sip:
-            domain = sip[0]
+        req_result = data.get("req_0")
+        top_code = data.get("code")
+        if not isinstance(req_result, dict):
+            logger.warning("QQ音乐vkey响应缺少req_0: song_mid=%s code=%r", song_mid, top_code)
+            return None
 
-        # 按音质优先级遍历，返回第一个有效的播放链接
-        for info in midurlinfo:
-            purl = info.get("purl", "") if isinstance(info, dict) else ""
-            if purl:
-                return f"{domain}{purl}"
+        module_code = req_result.get("code")
+        if top_code not in (None, 0) or module_code not in (None, 0):
+            logger.warning(
+                "QQ音乐vkey业务失败: song_mid=%s code=%r module_code=%r",
+                song_mid,
+                top_code,
+                module_code,
+            )
+            return None
 
+        result_data = req_result.get("data")
+        if not isinstance(result_data, dict):
+            logger.warning("QQ音乐vkey数据不是对象: song_mid=%s", song_mid)
+            return None
+
+        sip = result_data.get("sip")
+        midurlinfo = result_data.get("midurlinfo")
+        if not isinstance(sip, list) or not isinstance(midurlinfo, list):
+            logger.warning(
+                "QQ音乐vkey响应字段类型错误: song_mid=%s sip=%s midurlinfo=%s",
+                song_mid,
+                type(sip).__name__,
+                type(midurlinfo).__name__,
+            )
+            return None
+
+        # 按 filename 映射响应项，避免上游调整响应顺序后选错音质。
+        info_by_filename = {
+            str(info.get("filename", "")): info
+            for info in midurlinfo
+            if isinstance(info, dict) and info.get("filename")
+        }
+        ordered_info = [info_by_filename.get(filename) for filename in filenames]
+        if not info_by_filename and len(midurlinfo) == len(filenames):
+            ordered_info = [info if isinstance(info, dict) else None for info in midurlinfo]
+
+        for info in ordered_info:
+            if not info:
+                continue
+            purl = str(info.get("purl", "") or "").strip()
+            if not purl:
+                continue
+
+            if purl.startswith(("http://", "https://")):
+                audio_url = purl
+            else:
+                domain = next(
+                    (str(item) for item in sip if isinstance(item, str) and item.startswith("https://")),
+                    "",
+                )
+                if not domain:
+                    domain = next((str(item) for item in sip if isinstance(item, str) and item), "")
+                if not domain:
+                    logger.warning(
+                        "QQ音乐vkey返回相对URL但没有播放域名，继续尝试下一音质: song_mid=%s",
+                        song_mid,
+                    )
+                    continue
+                audio_url = urljoin(domain, purl)
+
+            parsed_url = urlparse(audio_url)
+            if parsed_url.scheme in {"http", "https"} and parsed_url.netloc:
+                return audio_url
+
+            logger.warning("QQ音乐vkey返回无效音频URL，继续尝试下一音质: song_mid=%s", song_mid)
+
+        diagnostics = [
+            {
+                "filename": str(info.get("filename", "")),
+                "result": info.get("result"),
+                "subcode": info.get("subcode"),
+                "purl_present": bool(info.get("purl")),
+            }
+            for info in midurlinfo
+            if isinstance(info, dict)
+        ]
+        logger.warning(
+            "QQ音乐vkey未返回可用音频: song_mid=%s authenticated=%s candidates=%s response=%s",
+            song_mid,
+            bool(uin != "0" and qqmusic_key),
+            filenames,
+            diagnostics,
+        )
         return None
 
     # ===== 辅助方法 =====

@@ -20,6 +20,9 @@ logger = logging.getLogger("maibot-music.api")
 # 网络请求超时（秒）
 _REQUEST_TIMEOUT = 10
 
+# 上游异常文本的日志预览长度，避免异常响应淹没日志
+_RESPONSE_ERROR_PREVIEW_LENGTH = 512
+
 # 网易云音乐 eapi 加密密钥（16 字节 AES-128-ECB）
 _EAPI_KEY = b"e82ckenh8dichen8"
 
@@ -236,9 +239,15 @@ class MusicSearchClient:
 
         result = data.get("result")
         if not isinstance(result, dict):
+            result_detail = ""
+            if isinstance(result, str):
+                result_preview = result[:_RESPONSE_ERROR_PREVIEW_LENGTH]
+                result_detail = f" result={result_preview!r}"
+                if len(result) > _RESPONSE_ERROR_PREVIEW_LENGTH:
+                    result_detail += f" result_length={len(result)}"
             raise MusicAPIResponseError(
                 "网易云音乐搜索响应格式错误: "
-                f"query={query!r} result_type={type(result).__name__}"
+                f"query={query!r} result_type={type(result).__name__}{result_detail}"
             )
 
         songs = result.get("songs", [])

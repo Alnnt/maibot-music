@@ -12,7 +12,7 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
 from .audio_cache import AudioCacheError, MusicAudioCache
-from .music_api import MusicSearchClient, SongInfo
+from .music_api import MusicAPIResponseError, MusicSearchClient, SongInfo
 from .url_parser import extract_urls, parse_music_card_text, parse_music_url
 
 
@@ -27,7 +27,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.4.1", description="配置版本")
+    config_version: str = Field(default="1.4.2", description="配置版本")
 
 
 class MusicConfig(PluginConfigBase):
@@ -464,6 +464,10 @@ class MusicPlugin(MaiBotPlugin):
 
         try:
             results = await api.search(query, resolved_platform, limit=self.config.music.search_limit)
+        except MusicAPIResponseError as exc:
+            self.ctx.logger.error("音乐搜索失败: %s", exc)
+            await self.ctx.send.text("搜索歌曲时出错，请稍后再试", stream_id)
+            return False, "搜索歌曲时出错，请稍后再试"
         except Exception:
             self.ctx.logger.exception("音乐搜索异常: %s", query)
             await self.ctx.send.text("搜索歌曲时出错，请稍后再试", stream_id)
@@ -536,6 +540,9 @@ class MusicPlugin(MaiBotPlugin):
         for try_platform in ordered_platforms:
             try:
                 results = await api.search(query, try_platform, limit=self.config.music.search_limit)
+            except MusicAPIResponseError as exc:
+                self.ctx.logger.error("音乐搜索失败(%s): %s", try_platform, exc)
+                continue
             except Exception:
                 self.ctx.logger.exception("音乐搜索异常(%s): %s", try_platform, query)
                 continue
@@ -852,6 +859,9 @@ class MusicPlugin(MaiBotPlugin):
                     api = self._get_api()
                     try:
                         results = await api.search(card_info.query, platform, limit=1)
+                    except MusicAPIResponseError as exc:
+                        self.ctx.logger.error("音乐卡片搜索失败: %s", exc)
+                        results = []
                     except Exception:
                         self.ctx.logger.exception("音乐卡片搜索异常: %s", card_info.query)
                         results = []

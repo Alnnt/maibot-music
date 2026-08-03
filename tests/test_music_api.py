@@ -86,7 +86,7 @@ async def test_search_netease_accepts_valid_empty_result() -> None:
 @pytest.mark.parametrize(
     ("response", "message"),
     [
-        ({"code": 200, "result": "异常响应"}, "result_type=str"),
+        ({"code": 200, "result": "异常响应"}, "result_type=str result='异常响应'"),
         ({"code": 500, "result": {}}, "code=500"),
         ({"code": 200, "result": {"songs": "异常响应"}}, "songs 不是列表"),
     ],
@@ -97,6 +97,21 @@ async def test_search_netease_rejects_invalid_response(response: object, message
 
     with pytest.raises(MusicAPIResponseError, match=message):
         await client.search_netease("everlasting liberty")
+
+
+@pytest.mark.asyncio
+async def test_search_netease_limits_string_result_in_error() -> None:
+    client = make_client()
+    result = "异常响应" * 200
+    client._netease_client.get.return_value = FakeResponse({"code": 200, "result": result})
+
+    with pytest.raises(MusicAPIResponseError) as exc_info:
+        await client.search_netease("测试")
+
+    message = str(exc_info.value)
+    assert f"result={result[:512]!r}" in message
+    assert f"result_length={len(result)}" in message
+    assert result not in message
 
 
 @pytest.mark.asyncio

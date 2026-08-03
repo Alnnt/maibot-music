@@ -33,6 +33,7 @@ music_api = _load_module("music_api", "music_api.py")
 _load_module("url_parser", "url_parser.py")
 plugin_module = _load_module("plugin", "plugin.py")
 MusicPlugin = plugin_module.MusicPlugin
+MusicAPIResponseError = music_api.MusicAPIResponseError
 SongInfo = music_api.SongInfo
 
 
@@ -64,6 +65,120 @@ class FakeAudioCache:
 
     async def release(self, cache_path: Path) -> None:
         self.released_path = cache_path
+
+
+@pytest.mark.asyncio
+async def test_search_protocol_error_logs_reason_without_traceback() -> None:
+    plugin = object.__new__(MusicPlugin)
+    plugin._plugin_config_instance = types.SimpleNamespace(
+        music=types.SimpleNamespace(default_platform="163", search_limit=5),
+    )
+    logger = types.SimpleNamespace(error=Mock(), exception=Mock())
+    plugin._ctx = types.SimpleNamespace(
+        send=types.SimpleNamespace(text=AsyncMock()),
+        logger=logger,
+    )
+    api = types.SimpleNamespace(
+        search=AsyncMock(
+            side_effect=MusicAPIResponseError(
+                "网易云音乐搜索响应格式错误: query='廉价 洛天依' "
+                "result_type=str result='访问过于频繁'"
+            )
+        ),
+    )
+    plugin._get_api = lambda: api
+
+    success, message = await plugin._do_search_and_send("廉价 洛天依", stream_id="stream-1")
+
+    assert success is False
+    assert message == "搜索歌曲时出错，请稍后再试"
+    logger.error.assert_called_once_with(
+        "音乐搜索失败: %s",
+        api.search.side_effect,
+    )
+    logger.exception.assert_not_called()
+    plugin.ctx.send.text.assert_awaited_once_with("搜索歌曲时出错，请稍后再试", "stream-1")
+
+
+@pytest.mark.asyncio
+async def test_unexpected_search_error_keeps_traceback_logging() -> None:
+    plugin = object.__new__(MusicPlugin)
+    plugin._plugin_config_instance = types.SimpleNamespace(
+        music=types.SimpleNamespace(default_platform="163", search_limit=5),
+    )
+    logger = types.SimpleNamespace(error=Mock(), exception=Mock())
+    plugin._ctx = types.SimpleNamespace(
+        send=types.SimpleNamespace(text=AsyncMock()),
+        logger=logger,
+    )
+    api = types.SimpleNamespace(search=AsyncMock(side_effect=RuntimeError("unexpected")))
+    plugin._get_api = lambda: api
+
+    success, _ = await plugin._do_search_and_send("测试", stream_id="stream-1")
+
+    assert success is False
+    logger.error.assert_not_called()
+    logger.exception.assert_called_once_with("音乐搜索异常: %s", "测试")
+
+
+@pytest.mark.asyncio
+async def test_tool_search_protocol_errors_log_reasons_without_traceback() -> None:
+    plugin = object.__new__(MusicPlugin)
+    plugin._plugin_config_instance = types.SimpleNamespace(
+        music=types.SimpleNamespace(default_platform="163", search_limit=5),
+    )
+    logger = types.SimpleNamespace(error=Mock(), exception=Mock())
+    plugin._ctx = types.SimpleNamespace(logger=logger)
+    api = types.SimpleNamespace(
+        search=AsyncMock(
+            side_effect=[
+                MusicAPIResponseError("网易云音乐搜索响应格式错误: result_type=str result='访问过于频繁'"),
+                MusicAPIResponseError("QQ音乐搜索业务失败: code=0 module_code=2001"),
+            ]
+        ),
+    )
+    plugin._get_api = lambda: api
+
+    result = await plugin.handle_search_music(query="廉价 洛天依", stream_id="stream-1")
+
+    assert result["name"] == "search_and_play_music"
+    assert logger.error.call_count == 2
+    assert "result='访问过于频繁'" in str(logger.error.call_args_list[0].args[2])
+    assert "module_code=2001" in str(logger.error.call_args_list[1].args[2])
+    logger.exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_music_card_search_protocol_error_logs_reason_without_traceback() -> None:
+    plugin = object.__new__(MusicPlugin)
+    plugin._plugin_config_instance = types.SimpleNamespace(
+        music=types.SimpleNamespace(
+            auto_parse_card=True,
+            auto_parse_url=False,
+            default_platform="163",
+        ),
+    )
+    logger = types.SimpleNamespace(error=Mock(), exception=Mock(), info=Mock())
+    plugin._ctx = types.SimpleNamespace(logger=logger)
+    api = types.SimpleNamespace(
+        search=AsyncMock(
+            side_effect=MusicAPIResponseError(
+                "网易云音乐搜索响应格式错误: result_type=str result='访问过于频繁'"
+            )
+        ),
+    )
+    plugin._get_api = lambda: api
+
+    result = await plugin.handle_music_url_parse(
+        message={
+            "processed_plain_text": "[网易云音乐] 廉价 - 洛天依",
+            "session_id": "stream-1",
+        }
+    )
+
+    assert result == {"action": "continue"}
+    logger.error.assert_called_once_with("音乐卡片搜索失败: %s", api.search.side_effect)
+    logger.exception.assert_not_called()
 
 
 @pytest.mark.asyncio

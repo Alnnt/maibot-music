@@ -23,6 +23,42 @@ _REQUEST_TIMEOUT = 10
 # 上游异常文本的日志预览长度，避免异常响应淹没日志
 _RESPONSE_ERROR_PREVIEW_LENGTH = 512
 
+# 上游响应中可能包含凭据的字段名片段
+_SENSITIVE_RESPONSE_KEY_PARTS = (
+    "authst",
+    "authorization",
+    "cookie",
+    "csrf",
+    "credential",
+    "key",
+    "music_a",
+    "music_u",
+    "password",
+    "session",
+    "secret",
+    "signature",
+    "ticket",
+    "token",
+)
+
+_SENSITIVE_TEXT_KEYS = (
+    r"authst|authorization|cookie|csrf|credential|qqmusic_key|qm_keyst|p_skey|skey|key|music_a|music_u|"
+    r"password|session|secret|signature|ticket|token"
+)
+
+_AUTHORIZATION_TEXT_PATTERN = re.compile(
+    r"(?i)(?P<prefix>\bauthorization\s*[:=]\s*)"
+    r"(?P<value>(?:basic|bearer|digest)\s+[^\s,;]+|[^\s,;]+)"
+)
+
+_COOKIE_HEADER_TEXT_PATTERN = re.compile(
+    r"(?im)(?P<prefix>(?<![\"'])\b(?:cookie|set-cookie)\s*:\s*)(?P<value>[^\r\n]+)"
+)
+
+_SENSITIVE_TEXT_ASSIGNMENT_PATTERN = re.compile(
+    rf"(?i)(?<![\w])(?P<prefix>[\"']?(?:{_SENSITIVE_TEXT_KEYS})[\"']?\s*[:=]\s*)"
+)
+
 # 网易云音乐 eapi 加密密钥（16 字节 AES-128-ECB）
 _EAPI_KEY = b"e82ckenh8dichen8"
 
@@ -47,6 +83,161 @@ _QQ_HEADERS = {
 
 class MusicAPIResponseError(RuntimeError):
     """音乐平台返回的响应不符合预期协议。"""
+
+    def __init__(self, message: str, *, response_detail: str = "") -> None:
+        super().__init__(message)
+        self.response_detail = response_detail
+
+    def diagnostic_message(self) -> str:
+        """返回适合写入独立错误日志的完整诊断信息。"""
+        if not self.response_detail:
+            return str(self)
+        return f"{self} response={self.response_detail}"
+
+
+def _sanitize_response_value(value: Any) -> Any:
+    """递归移除上游响应中可能包含的凭据。"""
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            normalized_key = key_text.lower()
+            if any(part in normalized_key for part in _SENSITIVE_RESPONSE_KEY_PARTS):
+                sanitized[key_text] = "[REDACTED]"
+            else:
+                sanitized[key_text] = _sanitize_response_value(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_response_value(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_response_text(value)
+    return value
+
+
+def _sanitize_response_text(value: str) -> str:
+    """移除非 JSON 响应文本中的常见凭据。"""
+    sanitized = _AUTHORIZATION_TEXT_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]",
+        value,
+    )
+    sanitized = _COOKIE_HEADER_TEXT_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]",
+        sanitized,
+    )
+    return _sanitize_text_assignments(sanitized)
+
+
+def _sanitize_text_assignments(value: str) -> str:
+    """扫描敏感字段赋值，完整遮蔽引号、数组和对象形式的值。"""
+    parts: list[str] = []
+    cursor = 0
+    while match := _SENSITIVE_TEXT_ASSIGNMENT_PATTERN.search(value, cursor):
+        value_start = match.end()
+        replacement, value_end = _redact_text_value(value, value_start)
+        parts.append(value[cursor:value_start])
+        parts.append(replacement)
+        cursor = value_end
+    parts.append(value[cursor:])
+    return "".join(parts)
+
+
+def _redact_text_value(value: str, start: int) -> tuple[str, int]:
+    """返回单个文本赋值的脱敏结果及原值结束位置。"""
+    if start >= len(value):
+        return "[REDACTED]", start
+
+    first = value[start]
+    if first in ("\"", "'"):
+        end = _quoted_text_value_end(value, start, first)
+        if end is None:
+            return "[REDACTED]", _line_end(value, start)
+        return f"{first}[REDACTED]{first}", end
+
+    if first in ("[", "{"):
+        end = _structured_text_value_end(value, start)
+        return "[REDACTED]", end if end is not None else _line_end(value, start)
+
+    end = start
+    while end < len(value) and value[end] not in "\"'&,;\r\n\t }]":
+        end += 1
+    return "[REDACTED]", end
+
+
+def _quoted_text_value_end(value: str, start: int, quote: str) -> int | None:
+    """定位支持反斜杠转义的引号值结尾。"""
+    escaped = False
+    for index in range(start + 1, len(value)):
+        char = value[index]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == quote:
+            return index + 1
+    return None
+
+
+def _structured_text_value_end(value: str, start: int) -> int | None:
+    """定位可能嵌套且包含字符串的数组或对象值结尾。"""
+    expected_closers: list[str] = []
+    quote = ""
+    escaped = False
+    pairs = {"[": "]", "{": "}"}
+
+    for index in range(start, len(value)):
+        char = value[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+
+        if char in ("\"", "'"):
+            quote = char
+        elif char in pairs:
+            expected_closers.append(pairs[char])
+        elif expected_closers and char == expected_closers[-1]:
+            expected_closers.pop()
+            if not expected_closers:
+                return index + 1
+
+    return None
+
+
+def _line_end(value: str, start: int) -> int:
+    """返回当前行的结束位置，供无法确定值边界时保守脱敏。"""
+    candidates = [position for marker in ("\r", "\n") if (position := value.find(marker, start)) >= 0]
+    return min(candidates, default=len(value))
+
+
+def _response_detail(value: Any) -> str:
+    """将完整上游响应转换为脱敏的单行日志文本。"""
+    sanitized = _sanitize_response_value(value)
+    try:
+        return json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return repr(sanitized)
+
+
+def _http_response_detail(response: httpx.Response) -> str:
+    """读取无法解析为 JSON 的 HTTP 响应文本。"""
+    try:
+        return _response_detail(response.json())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+
+    try:
+        return _response_detail(response.text)
+    except (httpx.ResponseNotRead, UnicodeDecodeError):
+        return "<response body unavailable>"
+
+
+def _request_error_detail(exc: httpx.RequestError) -> str:
+    """完整保留网络错误类型和原因，同时脱敏日志内容。"""
+    return _response_detail(f"{type(exc).__name__}: {exc}")
 
 
 @dataclass
@@ -213,29 +404,42 @@ class MusicSearchClient:
                 params={"s": query, "type": "1", "limit": str(limit), "offset": "0"},
             )
             resp.raise_for_status()
-        except httpx.TimeoutException:
-            logger.warning("网易云音乐搜索超时: %s", query)
-            return []
-        except httpx.HTTPStatusError as e:
-            logger.warning("网易云音乐搜索请求失败: %s %s", e.response.status_code, query)
-            return []
-        except httpx.RequestError:
-            logger.exception("网易云音乐搜索网络异常: %s", query)
-            return []
+        except httpx.TimeoutException as exc:
+            raise MusicAPIResponseError(
+                f"网易云音乐搜索超时: query={query!r}",
+                response_detail=_request_error_detail(exc),
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise MusicAPIResponseError(
+                f"网易云音乐搜索请求失败: query={query!r} status={exc.response.status_code}",
+                response_detail=_http_response_detail(exc.response),
+            ) from exc
+        except httpx.RequestError as exc:
+            raise MusicAPIResponseError(
+                f"网易云音乐搜索网络异常: query={query!r}",
+                response_detail=_request_error_detail(exc),
+            ) from exc
 
         try:
             data = resp.json()
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise MusicAPIResponseError(f"网易云音乐搜索响应不是有效 JSON: query={query!r}") from exc
+            raise MusicAPIResponseError(
+                f"网易云音乐搜索响应不是有效 JSON: query={query!r}",
+                response_detail=_http_response_detail(resp),
+            ) from exc
 
         if not isinstance(data, dict):
             raise MusicAPIResponseError(
-                f"网易云音乐搜索响应不是对象: query={query!r} type={type(data).__name__}"
+                f"网易云音乐搜索响应不是对象: query={query!r} type={type(data).__name__}",
+                response_detail=_response_detail(data),
             )
 
         code = data.get("code")
         if code != 200:
-            raise MusicAPIResponseError(f"网易云音乐搜索业务失败: query={query!r} code={code!r}")
+            raise MusicAPIResponseError(
+                f"网易云音乐搜索业务失败: query={query!r} code={code!r}",
+                response_detail=_response_detail(data),
+            )
 
         result = data.get("result")
         if not isinstance(result, dict):
@@ -247,14 +451,16 @@ class MusicSearchClient:
                     result_detail += f" result_length={len(result)}"
             raise MusicAPIResponseError(
                 "网易云音乐搜索响应格式错误: "
-                f"query={query!r} result_type={type(result).__name__}{result_detail}"
+                f"query={query!r} result_type={type(result).__name__}{result_detail}",
+                response_detail=_response_detail(data),
             )
 
         songs = result.get("songs", [])
         if not isinstance(songs, list):
             raise MusicAPIResponseError(
                 "网易云音乐搜索 songs 不是列表: "
-                f"query={query!r} type={type(songs).__name__}"
+                f"query={query!r} type={type(songs).__name__}",
+                response_detail=_response_detail(data),
             )
         if not songs:
             return []
@@ -264,13 +470,17 @@ class MusicSearchClient:
             if not isinstance(song, dict):
                 raise MusicAPIResponseError(
                     "网易云音乐搜索歌曲项不是对象: "
-                    f"query={query!r} type={type(song).__name__}"
+                    f"query={query!r} type={type(song).__name__}",
+                    response_detail=_response_detail(data),
                 )
 
             artists_data = song.get("artists", [])
             album_data = song.get("album", {})
             if not isinstance(artists_data, list) or not isinstance(album_data, dict):
-                raise MusicAPIResponseError(f"网易云音乐搜索歌曲字段格式错误: query={query!r}")
+                raise MusicAPIResponseError(
+                    f"网易云音乐搜索歌曲字段格式错误: query={query!r}",
+                    response_detail=_response_detail(data),
+                )
 
             song_id = str(song.get("id", ""))
             name = str(song.get("name", ""))
@@ -330,34 +540,49 @@ class MusicSearchClient:
             )
             resp.raise_for_status()
         except httpx.TimeoutException as exc:
-            raise MusicAPIResponseError(f"QQ音乐搜索超时: query={query!r}") from exc
+            raise MusicAPIResponseError(
+                f"QQ音乐搜索超时: query={query!r}",
+                response_detail=_request_error_detail(exc),
+            ) from exc
         except httpx.HTTPStatusError as exc:
             raise MusicAPIResponseError(
-                f"QQ音乐搜索请求失败: query={query!r} status={exc.response.status_code}"
+                f"QQ音乐搜索请求失败: query={query!r} status={exc.response.status_code}",
+                response_detail=_http_response_detail(exc.response),
             ) from exc
         except httpx.RequestError as exc:
-            raise MusicAPIResponseError(f"QQ音乐搜索网络异常: query={query!r}") from exc
+            raise MusicAPIResponseError(
+                f"QQ音乐搜索网络异常: query={query!r}",
+                response_detail=_request_error_detail(exc),
+            ) from exc
 
         try:
             data = resp.json()
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise MusicAPIResponseError(f"QQ音乐搜索响应不是有效 JSON: query={query!r}") from exc
+            raise MusicAPIResponseError(
+                f"QQ音乐搜索响应不是有效 JSON: query={query!r}",
+                response_detail=_http_response_detail(resp),
+            ) from exc
 
         if not isinstance(data, dict):
             raise MusicAPIResponseError(
-                f"QQ音乐搜索响应不是对象: query={query!r} type={type(data).__name__}"
+                f"QQ音乐搜索响应不是对象: query={query!r} type={type(data).__name__}",
+                response_detail=_response_detail(data),
             )
 
         req_result = data.get("req_1")
         if not isinstance(req_result, dict):
-            raise MusicAPIResponseError(f"QQ音乐搜索响应缺少 req_1: query={query!r}")
+            raise MusicAPIResponseError(
+                f"QQ音乐搜索响应缺少 req_1: query={query!r}",
+                response_detail=_response_detail(data),
+            )
 
         top_code = data.get("code")
         module_code = req_result.get("code")
         if top_code not in (None, 0) or module_code not in (None, 0):
             raise MusicAPIResponseError(
                 "QQ音乐搜索业务失败: "
-                f"query={query!r} code={top_code!r} module_code={module_code!r}"
+                f"query={query!r} code={top_code!r} module_code={module_code!r}",
+                response_detail=_response_detail(data),
             )
 
         result_data = req_result.get("data")
@@ -366,7 +591,8 @@ class MusicSearchClient:
         song_list = song_data.get("list") if isinstance(song_data, dict) else None
         if not isinstance(song_list, list):
             raise MusicAPIResponseError(
-                f"QQ音乐搜索响应歌曲列表格式错误: query={query!r} type={type(song_list).__name__}"
+                f"QQ音乐搜索响应歌曲列表格式错误: query={query!r} type={type(song_list).__name__}",
+                response_detail=_response_detail(data),
             )
 
         if not song_list:
@@ -376,7 +602,8 @@ class MusicSearchClient:
         for song in song_list:
             if not isinstance(song, dict):
                 raise MusicAPIResponseError(
-                    f"QQ音乐搜索歌曲项不是对象: query={query!r} type={type(song).__name__}"
+                    f"QQ音乐搜索歌曲项不是对象: query={query!r} type={type(song).__name__}",
+                    response_detail=_response_detail(data),
                 )
 
             singers = song.get("singer", [])
@@ -387,7 +614,10 @@ class MusicSearchClient:
                 or not isinstance(album_data, dict)
                 or not isinstance(file_data, dict)
             ):
-                raise MusicAPIResponseError(f"QQ音乐搜索歌曲字段格式错误: query={query!r}")
+                raise MusicAPIResponseError(
+                    f"QQ音乐搜索歌曲字段格式错误: query={query!r}",
+                    response_detail=_response_detail(data),
+                )
 
             song_mid = str(song.get("mid", "") or song.get("songmid", ""))
             name = str(song.get("name", "") or song.get("songname", ""))

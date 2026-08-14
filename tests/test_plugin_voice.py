@@ -29,10 +29,12 @@ def _load_module(module_name: str, file_name: str) -> types.ModuleType:
 
 
 _load_module("audio_cache", "audio_cache.py")
+error_log_module = _load_module("error_log", "error_log.py")
 music_api = _load_module("music_api", "music_api.py")
 _load_module("url_parser", "url_parser.py")
 plugin_module = _load_module("plugin", "plugin.py")
 MusicPlugin = plugin_module.MusicPlugin
+PluginErrorLog = error_log_module.PluginErrorLog
 MusicAPIResponseError = music_api.MusicAPIResponseError
 SongInfo = music_api.SongInfo
 
@@ -70,6 +72,8 @@ class FakeAudioCache:
 @pytest.mark.asyncio
 async def test_search_protocol_error_logs_reason_without_traceback() -> None:
     plugin = object.__new__(MusicPlugin)
+    error_log = types.SimpleNamespace(error=Mock(), exception=Mock())
+    plugin._error_log = error_log
     plugin._plugin_config_instance = types.SimpleNamespace(
         music=types.SimpleNamespace(default_platform="163", search_limit=5),
     )
@@ -97,12 +101,19 @@ async def test_search_protocol_error_logs_reason_without_traceback() -> None:
         api.search.side_effect,
     )
     logger.exception.assert_not_called()
+    error_log.error.assert_called_once_with(
+        "音乐搜索失败: %s",
+        api.search.side_effect.diagnostic_message(),
+    )
+    error_log.exception.assert_not_called()
     plugin.ctx.send.text.assert_awaited_once_with("搜索歌曲时出错，请稍后再试", "stream-1")
 
 
 @pytest.mark.asyncio
 async def test_unexpected_search_error_keeps_traceback_logging() -> None:
     plugin = object.__new__(MusicPlugin)
+    error_log = types.SimpleNamespace(error=Mock(), exception=Mock())
+    plugin._error_log = error_log
     plugin._plugin_config_instance = types.SimpleNamespace(
         music=types.SimpleNamespace(default_platform="163", search_limit=5),
     )
@@ -119,11 +130,20 @@ async def test_unexpected_search_error_keeps_traceback_logging() -> None:
     assert success is False
     logger.error.assert_not_called()
     logger.exception.assert_called_once_with("音乐搜索异常: %s", "测试")
+    error_log.error.assert_not_called()
+    error_log.exception.assert_called_once_with(
+        "音乐搜索异常: platform=%s query=%r error=%r",
+        "163",
+        "测试",
+        api.search.side_effect,
+    )
 
 
 @pytest.mark.asyncio
 async def test_tool_search_protocol_errors_log_reasons_without_traceback() -> None:
     plugin = object.__new__(MusicPlugin)
+    error_log = types.SimpleNamespace(error=Mock(), exception=Mock())
+    plugin._error_log = error_log
     plugin._plugin_config_instance = types.SimpleNamespace(
         music=types.SimpleNamespace(default_platform="163", search_limit=5),
     )
@@ -146,11 +166,17 @@ async def test_tool_search_protocol_errors_log_reasons_without_traceback() -> No
     assert "result='访问过于频繁'" in str(logger.error.call_args_list[0].args[2])
     assert "module_code=2001" in str(logger.error.call_args_list[1].args[2])
     logger.exception.assert_not_called()
+    assert error_log.error.call_count == 2
+    assert "result='访问过于频繁'" in str(error_log.error.call_args_list[0].args[2])
+    assert "module_code=2001" in str(error_log.error.call_args_list[1].args[2])
+    error_log.exception.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_music_card_search_protocol_error_logs_reason_without_traceback() -> None:
     plugin = object.__new__(MusicPlugin)
+    error_log = types.SimpleNamespace(error=Mock(), exception=Mock())
+    plugin._error_log = error_log
     plugin._plugin_config_instance = types.SimpleNamespace(
         music=types.SimpleNamespace(
             auto_parse_card=True,
@@ -179,6 +205,65 @@ async def test_music_card_search_protocol_error_logs_reason_without_traceback() 
     assert result == {"action": "continue"}
     logger.error.assert_called_once_with("音乐卡片搜索失败: %s", api.search.side_effect)
     logger.exception.assert_not_called()
+    error_log.error.assert_called_once_with(
+        "音乐卡片搜索失败(%s): %s",
+        "163",
+        api.search.side_effect.diagnostic_message(),
+    )
+    error_log.exception.assert_not_called()
+
+
+def test_plugin_error_log_only_creates_file_after_error(tmp_path: Path) -> None:
+    error_log = PluginErrorLog(tmp_path / "log")
+
+    assert not (tmp_path / "log" / "error.log").exists()
+
+    error_log.error("QQ音乐搜索失败: %s", "访问过于频繁")
+    error_log.error("QQ音乐响应包含非法字符: %s", "\ud800")
+    error_log.close()
+
+    content = (tmp_path / "log" / "error.log").read_text(encoding="utf-8")
+    assert "[ERROR] QQ音乐搜索失败: 访问过于频繁" in content
+    assert "[ERROR] QQ音乐响应包含非法字符: \\ud800" in content
+
+
+def test_plugin_error_log_preserves_existing_history(tmp_path: Path) -> None:
+    log_dir = tmp_path / "log"
+    first_log = PluginErrorLog(log_dir)
+    first_log.error("第一次错误")
+    first_log.close()
+
+    second_log = PluginErrorLog(log_dir)
+    second_log.error("第二次错误")
+    second_log.close()
+
+    content = (log_dir / "error.log").read_text(encoding="utf-8")
+    assert "第一次错误" in content
+    assert "第二次错误" in content
+    assert list(log_dir.glob("error.log.*")) == []
+
+
+@pytest.mark.asyncio
+async def test_on_load_uses_plugin_data_dir_for_error_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(MusicPlugin)
+    plugin._error_log = None
+    plugin._start_audio_cache = AsyncMock()
+    plugin._ctx = types.SimpleNamespace(
+        paths=types.SimpleNamespace(data_dir=tmp_path),
+        logger=types.SimpleNamespace(info=Mock()),
+    )
+    error_log = types.SimpleNamespace(close=Mock())
+    error_log_factory = Mock(return_value=error_log)
+    monkeypatch.setattr(plugin_module, "PluginErrorLog", error_log_factory)
+
+    await plugin.on_load()
+
+    error_log_factory.assert_called_once_with(tmp_path / "log")
+    plugin._start_audio_cache.assert_awaited_once_with()
+    assert plugin._error_log is error_log
 
 
 @pytest.mark.asyncio

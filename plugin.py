@@ -12,6 +12,7 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
 from .audio_cache import AudioCacheError, MusicAudioCache
+from .error_log import PluginErrorLog
 from .music_api import MusicAPIResponseError, MusicSearchClient, SongInfo
 from .url_parser import extract_urls, parse_music_card_text, parse_music_url
 
@@ -27,7 +28,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.4.2", description="配置版本")
+    config_version: str = Field(default="1.4.3", description="配置版本")
 
 
 class MusicConfig(PluginConfigBase):
@@ -151,6 +152,7 @@ class MusicPlugin(MaiBotPlugin):
         super().__init__()
         self._api: MusicSearchClient | None = None
         self._audio_cache: MusicAudioCache | None = None
+        self._error_log: PluginErrorLog | None = None
         self._cache_cleanup_task: asyncio.Task[None] | None = None
         self._voice_send_condition = asyncio.Condition()
         self._active_voice_sends = 0
@@ -416,16 +418,27 @@ class MusicPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         """插件加载，初始化本地音乐缓存。"""
-        await self._start_audio_cache()
+        self._error_log = PluginErrorLog(self.ctx.paths.data_dir / "log")
+        try:
+            await self._start_audio_cache()
+        except Exception:
+            self._error_log.close()
+            self._error_log = None
+            raise
         self.ctx.logger.info("音乐插件已加载")
 
     async def on_unload(self) -> None:
         """插件卸载，关闭 HTTP 客户端和缓存任务。"""
-        await self._stop_audio_cache()
-        if self._api is not None:
-            await self._api.close()
-            self._api = None
-        self._pending_choices.clear()
+        try:
+            await self._stop_audio_cache()
+            if self._api is not None:
+                await self._api.close()
+                self._api = None
+            self._pending_choices.clear()
+        finally:
+            if self._error_log is not None:
+                self._error_log.close()
+                self._error_log = None
         self.ctx.logger.info("音乐插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -466,10 +479,19 @@ class MusicPlugin(MaiBotPlugin):
             results = await api.search(query, resolved_platform, limit=self.config.music.search_limit)
         except MusicAPIResponseError as exc:
             self.ctx.logger.error("音乐搜索失败: %s", exc)
+            if self._error_log is not None:
+                self._error_log.error("音乐搜索失败: %s", exc.diagnostic_message())
             await self.ctx.send.text("搜索歌曲时出错，请稍后再试", stream_id)
             return False, "搜索歌曲时出错，请稍后再试"
-        except Exception:
+        except Exception as exc:
             self.ctx.logger.exception("音乐搜索异常: %s", query)
+            if self._error_log is not None:
+                self._error_log.exception(
+                    "音乐搜索异常: platform=%s query=%r error=%r",
+                    resolved_platform,
+                    query,
+                    exc,
+                )
             await self.ctx.send.text("搜索歌曲时出错，请稍后再试", stream_id)
             return False, "搜索歌曲时出错，请稍后再试"
 
@@ -542,9 +564,22 @@ class MusicPlugin(MaiBotPlugin):
                 results = await api.search(query, try_platform, limit=self.config.music.search_limit)
             except MusicAPIResponseError as exc:
                 self.ctx.logger.error("音乐搜索失败(%s): %s", try_platform, exc)
+                if self._error_log is not None:
+                    self._error_log.error(
+                        "音乐搜索失败(%s): %s",
+                        try_platform,
+                        exc.diagnostic_message(),
+                    )
                 continue
-            except Exception:
+            except Exception as exc:
                 self.ctx.logger.exception("音乐搜索异常(%s): %s", try_platform, query)
+                if self._error_log is not None:
+                    self._error_log.exception(
+                        "音乐搜索异常: platform=%s query=%r error=%r",
+                        try_platform,
+                        query,
+                        exc,
+                    )
                 continue
 
             if not results:
@@ -861,9 +896,22 @@ class MusicPlugin(MaiBotPlugin):
                         results = await api.search(card_info.query, platform, limit=1)
                     except MusicAPIResponseError as exc:
                         self.ctx.logger.error("音乐卡片搜索失败: %s", exc)
+                        if self._error_log is not None:
+                            self._error_log.error(
+                                "音乐卡片搜索失败(%s): %s",
+                                platform,
+                                exc.diagnostic_message(),
+                            )
                         results = []
-                    except Exception:
+                    except Exception as exc:
                         self.ctx.logger.exception("音乐卡片搜索异常: %s", card_info.query)
+                        if self._error_log is not None:
+                            self._error_log.exception(
+                                "音乐卡片搜索异常: platform=%s query=%r error=%r",
+                                platform,
+                                card_info.query,
+                                exc,
+                            )
                         results = []
 
                     if results:

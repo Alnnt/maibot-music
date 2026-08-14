@@ -21,8 +21,9 @@ MusicSearchClient = _MODULE.MusicSearchClient
 
 
 class FakeResponse:
-    def __init__(self, data: object) -> None:
+    def __init__(self, data: object, text: str = "") -> None:
         self._data = data
+        self.text = text
 
     def raise_for_status(self) -> None:
         return None
@@ -100,9 +101,9 @@ async def test_search_netease_rejects_invalid_response(response: object, message
 
 
 @pytest.mark.asyncio
-async def test_search_netease_limits_string_result_in_error() -> None:
+async def test_search_netease_preserves_full_string_result_in_diagnostic() -> None:
     client = make_client()
-    result = "异常响应" * 200
+    result = "异常响应" * 3000
     client._netease_client.get.return_value = FakeResponse({"code": 200, "result": result})
 
     with pytest.raises(MusicAPIResponseError) as exc_info:
@@ -113,6 +114,10 @@ async def test_search_netease_limits_string_result_in_error() -> None:
     assert f"result_length={len(result)}" in message
     assert result not in message
 
+    diagnostic = exc_info.value.diagnostic_message()
+    assert result in diagnostic
+    assert "truncated original_length" not in diagnostic
+
 
 @pytest.mark.asyncio
 async def test_search_netease_rejects_invalid_json() -> None:
@@ -121,6 +126,51 @@ async def test_search_netease_rejects_invalid_json() -> None:
 
     with pytest.raises(MusicAPIResponseError, match="不是有效 JSON"):
         await client.search_netease("everlasting liberty")
+
+
+@pytest.mark.asyncio
+async def test_search_netease_timeout_preserves_reason() -> None:
+    client = make_client()
+    client._netease_client.get.side_effect = _MODULE.httpx.ReadTimeout("request timed out")
+
+    with pytest.raises(MusicAPIResponseError, match="网易云音乐搜索超时") as exc_info:
+        await client.search_netease("测试")
+
+    diagnostic = exc_info.value.diagnostic_message()
+    assert "ReadTimeout" in diagnostic
+    assert "request timed out" in diagnostic
+
+
+@pytest.mark.asyncio
+async def test_search_netease_http_error_preserves_full_response() -> None:
+    client = make_client()
+    body = "上游拦截响应" * 3000
+    request = _MODULE.httpx.Request("GET", "https://music.163.com/api/search/get/web")
+    client._netease_client.get.return_value = _MODULE.httpx.Response(
+        403,
+        request=request,
+        text=body,
+    )
+
+    with pytest.raises(MusicAPIResponseError, match="status=403") as exc_info:
+        await client.search_netease("测试")
+
+    diagnostic = exc_info.value.diagnostic_message()
+    assert body in diagnostic
+    assert "truncated original_length" not in diagnostic
+
+
+@pytest.mark.asyncio
+async def test_search_netease_network_error_preserves_reason() -> None:
+    client = make_client()
+    client._netease_client.get.side_effect = _MODULE.httpx.ConnectError("connection refused")
+
+    with pytest.raises(MusicAPIResponseError, match="网易云音乐搜索网络异常") as exc_info:
+        await client.search_netease("测试")
+
+    diagnostic = exc_info.value.diagnostic_message()
+    assert "ConnectError" in diagnostic
+    assert "connection refused" in diagnostic
 
 
 @pytest.mark.asyncio
@@ -161,11 +211,113 @@ async def test_search_qq_extracts_media_mid() -> None:
 async def test_search_qq_rejects_business_error() -> None:
     client = make_client()
     client._qq_client.post.return_value = FakeResponse(
-        {"code": 0, "req_1": {"code": 1000, "data": {}}}
+        {
+            "code": 0,
+            "traceid": "trace-123",
+            "req_1": {
+                "code": 2001,
+                "data": {
+                    "area": "sz",
+                    "reason": "访问过于频繁",
+                    "authst": "secret-authst",
+                    "MUSIC_A": "secret-music-a",
+                    "MUSIC_U": "secret-music-u",
+                    "token": "secret-token",
+                },
+            },
+        }
     )
 
-    with pytest.raises(MusicAPIResponseError, match="QQ音乐搜索业务失败"):
+    with pytest.raises(MusicAPIResponseError, match="module_code=2001") as exc_info:
         await client.search_qq("测试")
+
+    diagnostic = exc_info.value.diagnostic_message()
+    assert '"traceid":"trace-123"' in diagnostic
+    assert '"area":"sz"' in diagnostic
+    assert '"reason":"访问过于频繁"' in diagnostic
+    assert diagnostic.count("[REDACTED]") == 4
+    assert "secret-authst" not in diagnostic
+    assert "secret-music-a" not in diagnostic
+    assert "secret-music-u" not in diagnostic
+    assert "secret-token" not in diagnostic
+
+
+@pytest.mark.asyncio
+async def test_search_qq_preserves_full_large_error_response() -> None:
+    client = make_client()
+    reason = "完整上游错误内容" * 2000
+    client._qq_client.post.return_value = FakeResponse(
+        {
+            "code": 0,
+            "req_1": {
+                "code": 2001,
+                "data": {"reason": reason},
+            },
+        }
+    )
+
+    with pytest.raises(MusicAPIResponseError) as exc_info:
+        await client.search_qq("测试")
+
+    diagnostic = exc_info.value.diagnostic_message()
+    assert reason in diagnostic
+    assert "truncated original_length" not in diagnostic
+
+
+@pytest.mark.asyncio
+async def test_search_qq_invalid_json_redacts_text_response() -> None:
+    client = make_client()
+    client._qq_client.post.return_value = InvalidJsonResponse(
+        None,
+        (
+            "upstream failed token='space separated secret'; "
+            "Authorization: Bearer secret-authorization\n"
+            "Cookie: session=secret-session; MUSIC_U=secret-music-u\n"
+            'callback({"credential":{"primary":"secret-primary"},'
+            '"ticket":["secret-a","secret-b"],'
+            '"secret":"escaped \\"secret-value\\" text"});\n'
+            "reason=访问过于频繁; "
+            "qqmusic_key=secret-qqmusic-key; "
+            "qm_keyst=secret-qm-keyst; "
+            "p_skey=secret-p-skey; "
+            "skey=secret-skey; "
+            "MUSIC_A=secret-music-a"
+        ),
+    )
+
+    with pytest.raises(MusicAPIResponseError, match="不是有效 JSON") as exc_info:
+        await client.search_qq("测试")
+
+    diagnostic = exc_info.value.diagnostic_message()
+    assert "upstream failed" in diagnostic
+    assert "reason=访问过于频繁" in diagnostic
+    assert diagnostic.count("[REDACTED]") == 11
+    assert "space separated secret" not in diagnostic
+    assert "secret-authorization" not in diagnostic
+    assert "secret-session" not in diagnostic
+    assert "secret-music-u" not in diagnostic
+    assert "secret-primary" not in diagnostic
+    assert "secret-a" not in diagnostic
+    assert "secret-b" not in diagnostic
+    assert "secret-value" not in diagnostic
+    assert "secret-qqmusic-key" not in diagnostic
+    assert "secret-qm-keyst" not in diagnostic
+    assert "secret-p-skey" not in diagnostic
+    assert "secret-skey" not in diagnostic
+    assert "secret-music-a" not in diagnostic
+
+
+@pytest.mark.asyncio
+async def test_search_qq_network_error_preserves_reason() -> None:
+    client = make_client()
+    client._qq_client.post.side_effect = _MODULE.httpx.ConnectError("connection refused")
+
+    with pytest.raises(MusicAPIResponseError, match="QQ音乐搜索网络异常") as exc_info:
+        await client.search_qq("测试")
+
+    diagnostic = exc_info.value.diagnostic_message()
+    assert "ConnectError" in diagnostic
+    assert "connection refused" in diagnostic
 
 
 @pytest.mark.asyncio

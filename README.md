@@ -52,8 +52,8 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 | `music.cache_download_timeout_seconds` | `30` | MaiBot 下载 MP3 的超时时间 |
 | `netease.MUSIC_U` | `""` | 网易云 `MUSIC_U`（用于高音质/付费歌曲） |
 | `netease.csrf_token` | `""` | 网易云 `__csrf`（与 MUSIC_U 配对） |
-| `qq.uin` | `""` | QQ音乐 `uin`（QQ 号） |
-| `qq.qqmusic_key` | `""` | QQ音乐 `qqmusic_key`（用于高音质） |
+| `qq.uin` | `""` | QQ音乐 `uin`（用于歌曲详情和播放资源请求，搜索不携带） |
+| `qq.qqmusic_key` | `""` | QQ音乐 `qqmusic_key`（用于播放资源和高音质，搜索始终匿名） |
 | `napcat.http_url` | `"http://127.0.0.1:9999"` | NapCat HTTP API 地址（用于解析音乐卡片原始数据） |
 | `napcat.http_token` | `""` | NapCat 访问令牌（留空则不鉴权） |
 

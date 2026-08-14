@@ -240,6 +240,11 @@ def _request_error_detail(exc: httpx.RequestError) -> str:
     return _response_detail(f"{type(exc).__name__}: {exc}")
 
 
+async def _remove_cookie_header(request: httpx.Request) -> None:
+    """确保 QQ 音乐搜索请求不携带客户端 CookieJar 中的任何 Cookie。"""
+    request.headers.pop("cookie", None)
+
+
 @dataclass
 class SongInfo:
     """歌曲信息。"""
@@ -300,7 +305,7 @@ class MusicSearchClient:
 
     Args:
         netease_cookie: 网易云音乐 Cookie，形如 {"MUSIC_U": "...", "__csrf": "..."}。
-        qq_cookie: QQ音乐 Cookie，形如 {"uin": "...", "qqmusic_key": "..."}。
+        qq_cookie: QQ音乐资源请求 Cookie，形如 {"uin": "...", "qqmusic_key": "..."}。
         napcat_url: NapCat HTTP API 地址（用于获取消息原始 JSON 解析音乐卡片）。
         napcat_token: NapCat HTTP API 访问令牌。
     """
@@ -341,6 +346,13 @@ class MusicSearchClient:
             cookies=netease_cookies,
             timeout=_REQUEST_TIMEOUT,
         )
+        # 搜索始终匿名；请求钩子同时阻止上游 Set-Cookie 污染后续搜索。
+        self._qq_search_client = httpx.AsyncClient(
+            headers=_QQ_HEADERS,
+            timeout=_REQUEST_TIMEOUT,
+            event_hooks={"request": [_remove_cookie_header]},
+        )
+        # 歌曲详情和播放资源请求继续使用用户配置的 QQ 音乐登录态。
         self._qq_client = httpx.AsyncClient(
             headers=_QQ_HEADERS,
             cookies=qq_cookies,
@@ -363,6 +375,7 @@ class MusicSearchClient:
         for client in (
             self._netease_client,
             self._eapi_client,
+            self._qq_search_client,
             self._qq_client,
             self._napcat_client,
         ):
@@ -534,7 +547,7 @@ class MusicSearchClient:
         }
 
         try:
-            resp = await self._qq_client.post(
+            resp = await self._qq_search_client.post(
                 "https://u.y.qq.com/cgi-bin/musicu.fcg",
                 json=req_data,
             )

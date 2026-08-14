@@ -40,9 +40,81 @@ class InvalidJsonResponse(FakeResponse):
 def make_client() -> MusicSearchClient:
     client = object.__new__(MusicSearchClient)
     client._netease_client = SimpleNamespace(get=AsyncMock())
+    client._qq_search_client = SimpleNamespace(post=AsyncMock())
     client._qq_client = SimpleNamespace(post=AsyncMock())
     client._qq_cookie = {}
     return client
+
+
+@pytest.mark.asyncio
+async def test_qq_search_client_is_anonymous_and_resource_client_uses_cookie() -> None:
+    client = MusicSearchClient(
+        qq_cookie={
+            "uin": "1234567890",
+            "qqmusic_key": "configured-key",
+        }
+    )
+
+    try:
+        search_request = client._qq_search_client.build_request(
+            "POST",
+            "https://u.y.qq.com/cgi-bin/musicu.fcg",
+        )
+        resource_request = client._qq_client.build_request(
+            "POST",
+            "https://u.y.qq.com/cgi-bin/musicu.fcg",
+        )
+
+        assert "cookie" not in search_request.headers
+        assert "uin=1234567890" in resource_request.headers["cookie"]
+        assert "qqmusic_key=configured-key" in resource_request.headers["cookie"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_qq_search_remains_anonymous_after_upstream_sets_cookie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_cookies: list[str | None] = []
+
+    async def handle_search(request: _MODULE.httpx.Request) -> _MODULE.httpx.Response:
+        request_cookies.append(request.headers.get("cookie"))
+        return _MODULE.httpx.Response(
+            200,
+            headers={"set-cookie": "session=upstream-session; Path=/"},
+            json={
+                "code": 0,
+                "req_1": {
+                    "code": 0,
+                    "data": {"body": {"song": {"list": []}}},
+                },
+            },
+        )
+
+    search_transport = _MODULE.httpx.MockTransport(handle_search)
+    async_client = _MODULE.httpx.AsyncClient
+
+    def create_client(*args: object, **kwargs: object) -> _MODULE.httpx.AsyncClient:
+        if "event_hooks" in kwargs:
+            kwargs["transport"] = search_transport
+        return async_client(*args, **kwargs)
+
+    monkeypatch.setattr(_MODULE.httpx, "AsyncClient", create_client)
+    client = MusicSearchClient(
+        qq_cookie={
+            "uin": "1234567890",
+            "qqmusic_key": "configured-key",
+        }
+    )
+
+    try:
+        assert await client.search_qq("第一次搜索") == []
+        assert await client.search_qq("第二次搜索") == []
+    finally:
+        await client.close()
+
+    assert request_cookies == [None, None]
 
 
 @pytest.mark.asyncio
@@ -176,7 +248,7 @@ async def test_search_netease_network_error_preserves_reason() -> None:
 @pytest.mark.asyncio
 async def test_search_qq_extracts_media_mid() -> None:
     client = make_client()
-    client._qq_client.post.return_value = FakeResponse(
+    client._qq_search_client.post.return_value = FakeResponse(
         {
             "code": 0,
             "req_1": {
@@ -205,12 +277,14 @@ async def test_search_qq_extracts_media_mid() -> None:
     assert len(results) == 1
     assert results[0].song_id == "song-mid"
     assert results[0].media_id == "media-mid"
+    client._qq_search_client.post.assert_awaited_once()
+    client._qq_client.post.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_search_qq_rejects_business_error() -> None:
     client = make_client()
-    client._qq_client.post.return_value = FakeResponse(
+    client._qq_search_client.post.return_value = FakeResponse(
         {
             "code": 0,
             "traceid": "trace-123",
@@ -246,7 +320,7 @@ async def test_search_qq_rejects_business_error() -> None:
 async def test_search_qq_preserves_full_large_error_response() -> None:
     client = make_client()
     reason = "完整上游错误内容" * 2000
-    client._qq_client.post.return_value = FakeResponse(
+    client._qq_search_client.post.return_value = FakeResponse(
         {
             "code": 0,
             "req_1": {
@@ -267,7 +341,7 @@ async def test_search_qq_preserves_full_large_error_response() -> None:
 @pytest.mark.asyncio
 async def test_search_qq_invalid_json_redacts_text_response() -> None:
     client = make_client()
-    client._qq_client.post.return_value = InvalidJsonResponse(
+    client._qq_search_client.post.return_value = InvalidJsonResponse(
         None,
         (
             "upstream failed token='space separated secret'; "
@@ -310,7 +384,7 @@ async def test_search_qq_invalid_json_redacts_text_response() -> None:
 @pytest.mark.asyncio
 async def test_search_qq_network_error_preserves_reason() -> None:
     client = make_client()
-    client._qq_client.post.side_effect = _MODULE.httpx.ConnectError("connection refused")
+    client._qq_search_client.post.side_effect = _MODULE.httpx.ConnectError("connection refused")
 
     with pytest.raises(MusicAPIResponseError, match="QQ音乐搜索网络异常") as exc_info:
         await client.search_qq("测试")

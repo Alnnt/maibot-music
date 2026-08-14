@@ -28,7 +28,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.4.3", description="配置版本")
+    config_version: str = Field(default="1.4.4", description="配置版本")
 
 
 class MusicConfig(PluginConfigBase):
@@ -99,11 +99,11 @@ class QQMusicConfig(PluginConfigBase):
 
     uin: str = Field(
         default="",
-        description="uin — QQ 号",
+        description="uin — QQ音乐登录账号，搜索必需",
     )
     qqmusic_key: str = Field(
         default="",
-        description="qqmusic_key — 鉴权令牌，VIP 用户用于获取高音质",
+        description="qqmusic_key — QQ音乐登录凭证，搜索必需，账号权益影响可播放范围",
     )
 
 

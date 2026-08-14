@@ -52,8 +52,8 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 | `music.cache_download_timeout_seconds` | `30` | MaiBot 下载 MP3 的超时时间 |
 | `netease.MUSIC_U` | `""` | 网易云 `MUSIC_U`（用于高音质/付费歌曲） |
 | `netease.csrf_token` | `""` | 网易云 `__csrf`（与 MUSIC_U 配对） |
-| `qq.uin` | `""` | QQ音乐 `uin`（用于歌曲详情和播放资源请求，搜索不携带） |
-| `qq.qqmusic_key` | `""` | QQ音乐 `qqmusic_key`（用于播放资源和高音质，搜索始终匿名） |
+| `qq.uin` | `""` | QQ音乐 `uin`（登录账号，搜索必需） |
+| `qq.qqmusic_key` | `""` | QQ音乐 `qqmusic_key`（登录凭证，搜索必需；账号权益影响可播放范围） |
 | `napcat.http_url` | `"http://127.0.0.1:9999"` | NapCat HTTP API 地址（用于解析音乐卡片原始数据） |
 | `napcat.http_token` | `""` | NapCat 访问令牌（留空则不鉴权） |
 
@@ -63,9 +63,9 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 
 ##### 因为使用的语音的形式发送：音质会被强制降低！！！！！
 
-##### QQ音乐会在需要时补查歌曲资源 ID；实际可播放范围仍取决于 Cookie 对应账号的会员、数字专辑购买和版权权限
+##### QQ音乐搜索必须配置有效的 `uin` 和 `qqmusic_key`；登录态失效时需要重新获取 Cookie
 
-##### 不配置 Cookie 时，插件以匿名态请求 API，通常只能获取非v非专的歌。
+##### 实际可播放范围仍取决于 Cookie 对应账号的会员、数字专辑购买和版权权限
 
 ### 播放模式
 

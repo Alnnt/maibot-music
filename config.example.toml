@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.4.3"
+config_version = "1.4.4"
 
 [music]
 default_platform = "163"
@@ -24,8 +24,8 @@ MUSIC_U = ""        # 登录凭证，用于获取高音质
 csrf_token = ""     # __csrf CSRF 令牌，与 MUSIC_U 配对
 
 [qq]
-uin = ""                # QQ 号
-qqmusic_key = ""        # 鉴权令牌，VIP 用户用于获取高音质
+uin = ""                # QQ音乐登录账号，搜索必需
+qqmusic_key = ""        # QQ音乐登录凭证，搜索必需，账号权益影响可播放范围
 
 [napcat]
 http_url = "http://127.0.0.1:9999"

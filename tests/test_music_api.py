@@ -40,81 +40,57 @@ class InvalidJsonResponse(FakeResponse):
 def make_client() -> MusicSearchClient:
     client = object.__new__(MusicSearchClient)
     client._netease_client = SimpleNamespace(get=AsyncMock())
-    client._qq_search_client = SimpleNamespace(post=AsyncMock())
     client._qq_client = SimpleNamespace(post=AsyncMock())
-    client._qq_cookie = {}
+    client._qq_cookie = {
+        "uin": "1234567890",
+        "qqmusic_key": "configured-key",
+    }
     return client
 
 
 @pytest.mark.asyncio
-async def test_qq_search_client_is_anonymous_and_resource_client_uses_cookie() -> None:
+async def test_qq_client_uses_configured_login_cookie() -> None:
     client = MusicSearchClient(
         qq_cookie={
-            "uin": "1234567890",
-            "qqmusic_key": "configured-key",
+            "uin": " 1234567890 ",
+            "qqmusic_key": " configured-key ",
         }
     )
 
     try:
-        search_request = client._qq_search_client.build_request(
-            "POST",
-            "https://u.y.qq.com/cgi-bin/musicu.fcg",
-        )
-        resource_request = client._qq_client.build_request(
+        request = client._qq_client.build_request(
             "POST",
             "https://u.y.qq.com/cgi-bin/musicu.fcg",
         )
 
-        assert "cookie" not in search_request.headers
-        assert "uin=1234567890" in resource_request.headers["cookie"]
-        assert "qqmusic_key=configured-key" in resource_request.headers["cookie"]
+        assert "uin=1234567890" in request.headers["cookie"]
+        assert "qqmusic_key=configured-key" in request.headers["cookie"]
     finally:
         await client.close()
 
 
 @pytest.mark.asyncio
-async def test_qq_search_remains_anonymous_after_upstream_sets_cookie(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("qq_cookie", "expected_missing"),
+    [
+        ({}, "qq.uin, qq.qqmusic_key"),
+        ({"uin": "1234567890"}, "qq.qqmusic_key"),
+        ({"qqmusic_key": "configured-key"}, "qq.uin"),
+        ({"uin": " ", "qqmusic_key": "\t"}, "qq.uin, qq.qqmusic_key"),
+    ],
+)
+async def test_search_qq_requires_complete_login_credentials(
+    qq_cookie: dict[str, str],
+    expected_missing: str,
 ) -> None:
-    request_cookies: list[str | None] = []
+    client = make_client()
+    client._qq_cookie = qq_cookie
 
-    async def handle_search(request: _MODULE.httpx.Request) -> _MODULE.httpx.Response:
-        request_cookies.append(request.headers.get("cookie"))
-        return _MODULE.httpx.Response(
-            200,
-            headers={"set-cookie": "session=upstream-session; Path=/"},
-            json={
-                "code": 0,
-                "req_1": {
-                    "code": 0,
-                    "data": {"body": {"song": {"list": []}}},
-                },
-            },
-        )
+    with pytest.raises(MusicAPIResponseError) as exc_info:
+        await client.search_qq("测试")
 
-    search_transport = _MODULE.httpx.MockTransport(handle_search)
-    async_client = _MODULE.httpx.AsyncClient
-
-    def create_client(*args: object, **kwargs: object) -> _MODULE.httpx.AsyncClient:
-        if "event_hooks" in kwargs:
-            kwargs["transport"] = search_transport
-        return async_client(*args, **kwargs)
-
-    monkeypatch.setattr(_MODULE.httpx, "AsyncClient", create_client)
-    client = MusicSearchClient(
-        qq_cookie={
-            "uin": "1234567890",
-            "qqmusic_key": "configured-key",
-        }
-    )
-
-    try:
-        assert await client.search_qq("第一次搜索") == []
-        assert await client.search_qq("第二次搜索") == []
-    finally:
-        await client.close()
-
-    assert request_cookies == [None, None]
+    assert str(exc_info.value) == f"QQ音乐搜索需要登录，缺少配置: {expected_missing}"
+    client._qq_client.post.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -248,7 +224,7 @@ async def test_search_netease_network_error_preserves_reason() -> None:
 @pytest.mark.asyncio
 async def test_search_qq_extracts_media_mid() -> None:
     client = make_client()
-    client._qq_search_client.post.return_value = FakeResponse(
+    client._qq_client.post.return_value = FakeResponse(
         {
             "code": 0,
             "req_1": {
@@ -277,14 +253,17 @@ async def test_search_qq_extracts_media_mid() -> None:
     assert len(results) == 1
     assert results[0].song_id == "song-mid"
     assert results[0].media_id == "media-mid"
-    client._qq_search_client.post.assert_awaited_once()
-    client._qq_client.post.assert_not_awaited()
+    client._qq_client.post.assert_awaited_once()
+    req_data = client._qq_client.post.await_args.kwargs["json"]
+    assert req_data["loginUin"] == "1234567890"
+    assert req_data["comm"]["uin"] == "1234567890"
+    assert req_data["comm"]["authst"] == "configured-key"
 
 
 @pytest.mark.asyncio
 async def test_search_qq_rejects_business_error() -> None:
     client = make_client()
-    client._qq_search_client.post.return_value = FakeResponse(
+    client._qq_client.post.return_value = FakeResponse(
         {
             "code": 0,
             "traceid": "trace-123",
@@ -292,7 +271,8 @@ async def test_search_qq_rejects_business_error() -> None:
                 "code": 2001,
                 "data": {
                     "area": "sz",
-                    "reason": "访问过于频繁",
+                    "feedbackURL": "https://y.qq.com/wk_v17/common_login.html#/login?QQAppid=100497308",
+                    "reason": "需要登录",
                     "authst": "secret-authst",
                     "MUSIC_A": "secret-music-a",
                     "MUSIC_U": "secret-music-u",
@@ -302,13 +282,17 @@ async def test_search_qq_rejects_business_error() -> None:
         }
     )
 
-    with pytest.raises(MusicAPIResponseError, match="module_code=2001") as exc_info:
+    with pytest.raises(
+        MusicAPIResponseError,
+        match="登录态失效或被拒绝.*module_code=2001",
+    ) as exc_info:
         await client.search_qq("测试")
 
     diagnostic = exc_info.value.diagnostic_message()
     assert '"traceid":"trace-123"' in diagnostic
     assert '"area":"sz"' in diagnostic
-    assert '"reason":"访问过于频繁"' in diagnostic
+    assert '"feedbackURL":"https://y.qq.com/wk_v17/common_login.html#/login?QQAppid=100497308"' in diagnostic
+    assert '"reason":"需要登录"' in diagnostic
     assert diagnostic.count("[REDACTED]") == 4
     assert "secret-authst" not in diagnostic
     assert "secret-music-a" not in diagnostic
@@ -320,7 +304,7 @@ async def test_search_qq_rejects_business_error() -> None:
 async def test_search_qq_preserves_full_large_error_response() -> None:
     client = make_client()
     reason = "完整上游错误内容" * 2000
-    client._qq_search_client.post.return_value = FakeResponse(
+    client._qq_client.post.return_value = FakeResponse(
         {
             "code": 0,
             "req_1": {
@@ -341,7 +325,7 @@ async def test_search_qq_preserves_full_large_error_response() -> None:
 @pytest.mark.asyncio
 async def test_search_qq_invalid_json_redacts_text_response() -> None:
     client = make_client()
-    client._qq_search_client.post.return_value = InvalidJsonResponse(
+    client._qq_client.post.return_value = InvalidJsonResponse(
         None,
         (
             "upstream failed token='space separated secret'; "
@@ -384,7 +368,7 @@ async def test_search_qq_invalid_json_redacts_text_response() -> None:
 @pytest.mark.asyncio
 async def test_search_qq_network_error_preserves_reason() -> None:
     client = make_client()
-    client._qq_search_client.post.side_effect = _MODULE.httpx.ConnectError("connection refused")
+    client._qq_client.post.side_effect = _MODULE.httpx.ConnectError("connection refused")
 
     with pytest.raises(MusicAPIResponseError, match="QQ音乐搜索网络异常") as exc_info:
         await client.search_qq("测试")
@@ -489,7 +473,7 @@ async def test_qq_missing_media_mid_uses_song_mid_as_resource_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_qq_vkey_uses_anonymous_login_flag_and_falls_back_by_quality() -> None:
+async def test_qq_vkey_uses_login_credentials_and_falls_back_by_quality() -> None:
     client = make_client()
     filenames = ["M800media-mid.mp3", "M500media-mid.mp3"]
     client._qq_client.post.return_value = FakeResponse(
@@ -513,7 +497,10 @@ async def test_qq_vkey_uses_anonymous_login_flag_and_falls_back_by_quality() -> 
     assert audio_url == "https://isure.stream.qqmusic.qq.com/audio/test.mp3"
     request_data = client._qq_client.post.await_args.kwargs["json"]
     assert request_data["req_0"]["param"]["loginflag"] == 1
-    assert request_data["req_0"]["param"]["uin"] == "0"
+    assert request_data["req_0"]["param"]["uin"] == "1234567890"
+    assert request_data["loginUin"] == "1234567890"
+    assert request_data["comm"]["uin"] == "1234567890"
+    assert request_data["comm"]["authst"] == "configured-key"
 
 
 @pytest.mark.asyncio

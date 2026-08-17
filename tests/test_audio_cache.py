@@ -68,6 +68,47 @@ async def test_downloads_mp3_and_reuses_cache(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("platform", "expected_referer"),
+    [
+        ("163", "https://music.163.com/"),
+        ("qq", "https://y.qq.com/"),
+    ],
+)
+async def test_download_uses_fixed_platform_headers(
+    tmp_path: Path,
+    platform: str,
+    expected_referer: str,
+) -> None:
+    captured_request: httpx.Request | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_request
+        captured_request = request
+        return httpx.Response(
+            200,
+            headers={"content-type": "audio/mpeg"},
+            content=_MP3_DATA,
+            request=request,
+        )
+
+    cache = _build_cache(tmp_path, httpx.MockTransport(handler))
+    await cache.initialize()
+    cache_path = await cache.get_or_download(platform, "123", "https://example.test/song.mp3")
+
+    assert captured_request is not None
+    assert (
+        captured_request.headers["user-agent"]
+        == "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    )
+    assert captured_request.headers["referer"] == expected_referer
+    assert "cookie" not in captured_request.headers
+
+    await cache.release(cache_path)
+    await cache.close()
+
+
+@pytest.mark.asyncio
 async def test_rejects_non_mp3_response(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

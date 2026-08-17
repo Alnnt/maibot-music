@@ -18,6 +18,16 @@ _MP3_CONTENT_TYPES = frozenset({
     "audio/x-mpeg",
     "application/octet-stream",
 })
+_AUDIO_DOWNLOAD_HEADERS = {
+    "163": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://music.163.com/",
+    },
+    "qq": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://y.qq.com/",
+    },
+}
 _SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
 _MPEG1_LAYER3_BITRATES = (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0)
 _MPEG2_LAYER3_BITRATES = (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0)
@@ -104,7 +114,7 @@ class MusicAudioCache:
                     return target_path
 
                 try:
-                    await self._download(audio_url, target_path)
+                    await self._download(platform, audio_url, target_path)
                     async with self._state_lock:
                         await asyncio.to_thread(self._enforce_size_limit_sync, target_path)
                     return target_path
@@ -160,12 +170,13 @@ class MusicAudioCache:
         async with self._state_lock:
             await asyncio.to_thread(self._enforce_size_limit_sync, protected_path)
 
-    async def _download(self, audio_url: str, target_path: Path) -> None:
+    async def _download(self, platform: str, audio_url: str, target_path: Path) -> None:
         temp_path = target_path.with_suffix(".mp3.part")
         await asyncio.to_thread(temp_path.unlink, missing_ok=True)
+        headers = _AUDIO_DOWNLOAD_HEADERS.get(platform, {})
 
         try:
-            async with self._client.stream("GET", audio_url) as response:
+            async with self._client.stream("GET", audio_url, headers=headers) as response:
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
                 if content_type and content_type not in _MP3_CONTENT_TYPES:

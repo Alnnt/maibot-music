@@ -124,6 +124,163 @@ async def test_search_netease_parses_valid_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_netease_eapi_reuses_search_session_cookie() -> None:
+    captured_requests: list[_MODULE.httpx.Request] = []
+
+    def handler(request: _MODULE.httpx.Request) -> _MODULE.httpx.Response:
+        captured_requests.append(request)
+        if request.url.path == "/api/search/get/web":
+            return _MODULE.httpx.Response(
+                200,
+                headers={"Set-Cookie": "NMTID=session-id; Domain=.music.163.com; Path=/"},
+                json={"code": 200, "result": {}},
+                request=request,
+            )
+        if request.url.path == "/redirect":
+            return _MODULE.httpx.Response(
+                302,
+                headers={"Location": "https://example.test/song.mp3"},
+                request=request,
+            )
+        if request.url.host == "example.test":
+            return _MODULE.httpx.Response(200, request=request)
+        return _MODULE.httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "data": [{"url": "https://example.test/song.mp3"}],
+            },
+            request=request,
+        )
+
+    client = MusicSearchClient(
+        netease_cookie={
+            "MUSIC_U": "configured-music-u",
+            "__csrf": "configured-csrf",
+        }
+    )
+    netease_cookies = client._netease_client.cookies
+    await client._netease_client.aclose()
+    client._netease_client = _MODULE.httpx.AsyncClient(
+        headers=_MODULE._NETEASE_HEADERS,
+        cookies=netease_cookies,
+        transport=_MODULE.httpx.MockTransport(handler),
+        timeout=_MODULE._REQUEST_TIMEOUT,
+        follow_redirects=True,
+    )
+
+    try:
+        await client.search_netease("测试", limit=1)
+        audio_url = await client._get_netease_eapi_url("123", 320000)
+
+        assert audio_url == "https://example.test/song.mp3"
+        assert len(captured_requests) == 2
+        eapi_request = captured_requests[1]
+        assert eapi_request.url.host == "interface.music.163.com"
+        assert "NMTID=session-id" in eapi_request.headers["cookie"]
+        assert "MUSIC_U=configured-music-u" in eapi_request.headers["cookie"]
+        assert "__csrf=configured-csrf" in eapi_request.headers["cookie"]
+        assert eapi_request.headers["user-agent"] == _MODULE._EAPI_HEADERS["User-Agent"]
+        assert eapi_request.headers["referer"] == _MODULE._EAPI_HEADERS["Referer"]
+
+        external_request = client._netease_client.build_request(
+            "GET",
+            "https://example.test/song.mp3",
+        )
+        assert "cookie" not in external_request.headers
+
+        redirect_response = await client._netease_client.get(
+            "https://music.163.com/redirect",
+        )
+        assert redirect_response.status_code == 200
+        assert "MUSIC_U=configured-music-u" in captured_requests[2].headers["cookie"]
+        assert "__csrf=configured-csrf" in captured_requests[2].headers["cookie"]
+        assert "cookie" not in captured_requests[3].headers
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_netease_eapi_refreshes_url_after_cold_session_initialization() -> None:
+    captured_requests: list[_MODULE.httpx.Request] = []
+
+    def handler(request: _MODULE.httpx.Request) -> _MODULE.httpx.Response:
+        captured_requests.append(request)
+        response_url = (
+            "https://example.test/cold.mp3"
+            if len(captured_requests) == 1
+            else "https://example.test/initialized.mp3"
+        )
+        headers = {}
+        if len(captured_requests) == 1:
+            headers["Set-Cookie"] = "NMTID=session-id; Domain=.music.163.com; Path=/"
+        return _MODULE.httpx.Response(
+            200,
+            headers=headers,
+            json={"code": 200, "data": [{"url": response_url}]},
+            request=request,
+        )
+
+    client = MusicSearchClient()
+    await client._netease_client.aclose()
+    client._netease_client = _MODULE.httpx.AsyncClient(
+        headers=_MODULE._NETEASE_HEADERS,
+        transport=_MODULE.httpx.MockTransport(handler),
+        timeout=_MODULE._REQUEST_TIMEOUT,
+        follow_redirects=True,
+    )
+
+    try:
+        audio_url = await client._get_netease_eapi_url("123", 320000)
+
+        assert audio_url == "https://example.test/initialized.mp3"
+        assert len(captured_requests) == 2
+        assert "cookie" not in captured_requests[0].headers
+        assert "NMTID=session-id" in captured_requests[1].headers["cookie"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_netease_eapi_does_not_follow_redirects() -> None:
+    captured_requests: list[_MODULE.httpx.Request] = []
+
+    def handler(request: _MODULE.httpx.Request) -> _MODULE.httpx.Response:
+        captured_requests.append(request)
+        if request.url.host == "interface.music.163.com":
+            return _MODULE.httpx.Response(
+                302,
+                headers={"Location": "https://example.test/redirected"},
+                request=request,
+            )
+        return _MODULE.httpx.Response(200, request=request)
+
+    client = MusicSearchClient()
+    await client._netease_client.aclose()
+    client._netease_client = _MODULE.httpx.AsyncClient(
+        headers=_MODULE._NETEASE_HEADERS,
+        transport=_MODULE.httpx.MockTransport(handler),
+        timeout=_MODULE._REQUEST_TIMEOUT,
+        follow_redirects=True,
+    )
+    client._netease_client.cookies.set(
+        "NMTID",
+        "session-id",
+        domain=".music.163.com",
+        path="/",
+    )
+
+    try:
+        audio_url = await client._get_netease_eapi_url("123", 320000)
+
+        assert audio_url is None
+        assert len(captured_requests) == 1
+        assert captured_requests[0].url.host == "interface.music.163.com"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_search_netease_accepts_valid_empty_result() -> None:
     client = make_client()
     client._netease_client.get.return_value = FakeResponse({"code": 200, "result": {}})

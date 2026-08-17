@@ -318,11 +318,21 @@ class MusicSearchClient:
         self._napcat_token = napcat_token.strip()
 
         # 将用户提供的 Cookie 注入到 HTTP 客户端
-        netease_cookies = {}
+        netease_cookies = httpx.Cookies()
         if self._netease_cookie.get("MUSIC_U"):
-            netease_cookies["MUSIC_U"] = self._netease_cookie["MUSIC_U"]
+            netease_cookies.set(
+                "MUSIC_U",
+                self._netease_cookie["MUSIC_U"],
+                domain=".music.163.com",
+                path="/",
+            )
         if self._netease_cookie.get("__csrf"):
-            netease_cookies["__csrf"] = self._netease_cookie["__csrf"]
+            netease_cookies.set(
+                "__csrf",
+                self._netease_cookie["__csrf"],
+                domain=".music.163.com",
+                path="/",
+            )
 
         qq_cookies = {}
         if self._qq_cookie.get("uin"):
@@ -330,16 +340,13 @@ class MusicSearchClient:
         if self._qq_cookie.get("qqmusic_key"):
             qq_cookies["qqmusic_key"] = self._qq_cookie["qqmusic_key"]
 
+        # 搜索和播放地址接口必须共享网易云会话，确保搜索响应设置的
+        # NMTID 等 Cookie 能用于首次 EAPI 播放地址请求。
         self._netease_client = httpx.AsyncClient(
             headers=_NETEASE_HEADERS,
             cookies=netease_cookies,
             timeout=_REQUEST_TIMEOUT,
             follow_redirects=True,
-        )
-        self._eapi_client = httpx.AsyncClient(
-            headers=_EAPI_HEADERS,
-            cookies=netease_cookies,
-            timeout=_REQUEST_TIMEOUT,
         )
         # QQ 音乐搜索、歌曲详情和播放资源请求都需要用户配置的登录态。
         self._qq_client = httpx.AsyncClient(
@@ -363,7 +370,6 @@ class MusicSearchClient:
         """关闭 HTTP 客户端。"""
         for client in (
             self._netease_client,
-            self._eapi_client,
             self._qq_client,
             self._napcat_client,
         ):
@@ -848,10 +854,27 @@ class MusicSearchClient:
 
         try:
             enc_params = _eapi_encrypt(api_path, params)
-            resp = await self._eapi_client.post(
-                f"https://interface.music.163.com/eapi{api_path}",
-                data={"params": enc_params},
+            session_was_cold = not any(
+                cookie.name == "NMTID" for cookie in self._netease_client.cookies.jar
             )
+            request_url = f"https://interface.music.163.com/eapi{api_path}"
+            request_data = {"params": enc_params}
+            resp = await self._netease_client.post(
+                request_url,
+                data=request_data,
+                headers=_EAPI_HEADERS,
+                follow_redirects=False,
+            )
+            if session_was_cold and any(
+                cookie.name == "NMTID" for cookie in self._netease_client.cookies.jar
+            ):
+                logger.debug("网易云EAPI会话已初始化，重新获取播放URL: %s", song_id)
+                resp = await self._netease_client.post(
+                    request_url,
+                    data=request_data,
+                    headers=_EAPI_HEADERS,
+                    follow_redirects=False,
+                )
             resp.raise_for_status()
             data = resp.json()
             logger.debug("网易云eapi响应: song_id=%s code=%s", song_id, data.get("code"))

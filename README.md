@@ -6,7 +6,7 @@ MaiBot 音乐插件，支持搜索点歌、解析音乐链接，发送语音音�
 
 - **搜索点歌**：通过关键词搜索歌曲，发送可播放的语音音频或音乐卡片
 - **双平台支持**：网易云音乐（163）和QQ音乐（qq）
-- **播放模式切换**：支持语音音频（voice）和音乐卡片（card）两种播放模式，可通过配置切换；音乐卡片仅支持网易云音乐
+- **播放模式切换**：支持语音音频（voice）和音乐卡片（card）两种播放模式，可通过配置切换；card 模式下网易云音乐与QQ音乐均可发送音乐卡片（QQ 音乐卡片由插件自解析直链与元数据并构造）
 - **命令触发**：使用 `/点歌` 命令快速点歌，前缀符号可自定义（如 `#点歌`）
 - **LLM 调用**：通过自然语言让 AI 帮你点歌
 - **链接解析**：自动识别消息中的音乐链接，发送语音音频
@@ -41,7 +41,7 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 | `music.auto_parse_card` | `true` | 是否自动解析音乐分享卡片（QQ音乐/网易云卡片和小程序） |
 | `music.search_limit` | `5` | 搜索结果数量 |
 | `music.auto_select_first` | `false` | 多首结果时跳过选歌阶段，直接发送第一首 |
-| `music.play_mode` | `"card"` | 播放模式：`voice`(语音音频) 或 `card`(音乐卡片，仅支持网易云音乐) |
+| `music.play_mode` | `"card"` | 播放模式：`voice`(语音音频) 或 `card`(音乐卡片；网易云为平台型卡片，QQ音乐为自定义音乐卡片) |
 | `music.voice_source` | `"local"` | voice 模式的音频来源：`local`(MaiBot 下载到共享缓存) 或 `remote`(NapCat 直接下载远程 URL) |
 | `music.cache_storage_dir` | `"/root/maimai/MaiBot/data/music_cache"` | MaiBot 写入音乐缓存的目录 |
 | `music.cache_napcat_dir` | `"/app/music_cache"` | 同一缓存目录在 NapCat 进程内的可见路径 |
@@ -54,7 +54,7 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 | `netease.csrf_token` | `""` | 网易云 `__csrf`（与 MUSIC_U 配对） |
 | `qq.uin` | `""` | QQ音乐 `uin`（登录账号，搜索必需） |
 | `qq.qqmusic_key` | `""` | QQ音乐 `qqmusic_key`（登录凭证，搜索必需；账号权益影响可播放范围） |
-| `napcat.http_url` | `"http://127.0.0.1:9999"` | NapCat HTTP API 地址（用于解析音乐卡片原始数据） |
+| `napcat.http_url` | `"http://127.0.0.1:9999"` | NapCat HTTP API 地址（用于解析音乐卡片原始数据、直连发送QQ音乐卡片） |
 | `napcat.http_token` | `""` | NapCat 访问令牌（留空则不鉴权） |
 
 ### Cookie 获取方法
@@ -74,11 +74,13 @@ AI 通过 `search_and_play_music` 工具点歌时，会直接播放最佳匹配�
 | 模式 | 说明 |
 |------|------|
 | `voice` | 插件获取音频 URL。默认由 MaiBot 下载 MP3 到共享缓存，NapCat 读取本地文件并上传为语音消息 |
-| `card` | 通过 NapCat 平台型 music 段发送网易云音乐卡片，只需传入歌曲 ID，NapCat 负责解析音频和卡片展示。卡片可点击播放，音质取决于 NapCat 的解析能力。该模式仅支持网易云音乐 |
+| `card` | 网易云音乐：通过 NapCat 平台型 music 段（type=163 + id）发送，NapCat 负责解析音频和卡片展示。QQ音乐：插件自解析歌曲标题、歌手、封面与可播放直链（musicu.fcg），把 url/audio/title/image/content 拼成自定义音乐卡片 CQ 码，**直连 `napcat.http_url` 的 `/send_group_msg`（群聊）或 `/send_private_msg`（私聊）发送**，绕开 MaiBot 适配器对 music 段的改写；直连不可用时回退为自定义 music 段（type=custom）走适配器。卡片均可点击播放 |
 
-> **注意：音乐卡片仅支持网易云音乐。** QQ 音乐卡片依赖外部音乐签名服务，可能因签名服务关闭 QQ 音乐 ID 解析而发送失败。需要播放 QQ 音乐时，请将 `music.play_mode` 设置为 `"voice"`。
+> **QQ 音乐卡片说明**：`/点歌 qq` 搜索仍须配置有效的 `qq.uin` 与 `qqmusic_key`（登录态失效需重新获取）；歌曲详情与直链解析匿名即可（已配置时享受账号权益）。直链优先 m4a、失败回退 mp3，发送前 HEAD 校验；受版权/VIP 限制或直链失效时，自动降级发送可点击跳转的音乐卡片。
+>
+> QQ 音乐卡片由插件从 Runner 侧直连 NapCat HTTP API 发送，**不会写入 MaiBot 的聊天历史**（仅记录日志），且要求 `napcat.http_url` 指向机器人所在的 NapCat、`napcat.http_token` 与 NapCat 配置一致。
 
-card 模式依赖 NapCat 适配器（已支持 `music` 出站段），不会下载或创建本地音乐缓存。
+card 模式依赖 NapCat 适配器（已支持 `music` 出站段；网易云走平台型、QQ 音乐走 `type=custom`），不会下载或创建本地音乐缓存。
 
 ### Voice 本地缓存
 
@@ -165,7 +167,7 @@ volumes:
 
 感谢以下贡献者为本插件提交改进：
 
-- [Alnnt](https://github.com/Alnnt) — 自定义命令前缀、多首结果自动选择第一首
+- [Alnnt](https://github.com/Alnnt) — 自定义命令前缀、多首结果自动选择第一首、QQ音乐发送卡片
 - [oversk7](https://github.com/oversk7) — 修复 Tool 调用播放失败的多个问题
 
 欢迎通过 Pull Request 贡献代码。

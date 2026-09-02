@@ -728,3 +728,250 @@ async def test_qq_vkey_logs_empty_candidates(caplog: pytest.LogCaptureFixture) -
     assert result is None
     assert "QQ音乐vkey未返回可用音频" in caplog.text
     assert "purl_present" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_qq_music_card_uses_provided_meta_and_prefers_m4a() -> None:
+    client = make_client()
+    song = _MODULE.SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="测试专辑",
+        platform="qq",
+        media_id="media-mid",
+        album_mid="album-mid",
+    )
+    client.get_qq_song_detail = AsyncMock()
+    client._get_qq_vkey_batch = AsyncMock(
+        return_value="https://example.test/C400media-mid.m4a?vkey=secret"
+    )
+    client._head_ok = AsyncMock(return_value=True)
+
+    payload = await client.qq_music_card(song)
+
+    assert payload == {
+        "type": "custom",
+        "url": "https://y.qq.com/n/ryqq/songDetail/song-mid",
+        "title": "测试歌曲",
+        "image": "https://y.qq.com/music/photo_new/T002R300x300M000album-mid.jpg?max_age=2592000",
+        "content": "测试歌手",
+        "audio": "https://example.test/C400media-mid.m4a?vkey=secret",
+    }
+    client.get_qq_song_detail.assert_not_awaited()
+    client._get_qq_vkey_batch.assert_awaited_once_with(["C400media-mid.m4a"], "song-mid")
+    client._head_ok.assert_awaited_once_with("https://example.test/C400media-mid.m4a?vkey=secret")
+
+
+@pytest.mark.asyncio
+async def test_qq_music_card_m4a_head_fail_falls_back_to_mp3() -> None:
+    client = make_client()
+    song = _MODULE.SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="测试专辑",
+        platform="qq",
+        media_id="media-mid",
+        album_mid="album-mid",
+    )
+    client.get_qq_song_detail = AsyncMock()
+    client._get_qq_vkey_batch = AsyncMock(
+        side_effect=[
+            "https://example.test/C400media-mid.m4a?vkey=secret",
+            "https://example.test/M500media-mid.mp3?vkey=secret2",
+        ]
+    )
+    client._head_ok = AsyncMock(side_effect=[False, True])
+
+    payload = await client.qq_music_card(song)
+
+    assert payload["audio"] == "https://example.test/M500media-mid.mp3?vkey=secret2"
+    assert client._get_qq_vkey_batch.await_count == 2
+    assert client._get_qq_vkey_batch.await_args_list[0].args == (["C400media-mid.m4a"], "song-mid")
+    assert client._get_qq_vkey_batch.await_args_list[1].args == (["M500media-mid.mp3"], "song-mid")
+
+
+@pytest.mark.asyncio
+async def test_qq_music_card_without_audio_is_jump_card() -> None:
+    client = make_client()
+    song = _MODULE.SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="测试专辑",
+        platform="qq",
+        media_id="media-mid",
+        album_mid="album-mid",
+    )
+    client.get_qq_song_detail = AsyncMock()
+    client._get_qq_vkey_batch = AsyncMock(return_value=None)
+
+    payload = await client.qq_music_card(song)
+
+    assert payload is not None
+    assert payload["audio"] == ""
+    assert payload["type"] == "custom"
+    assert payload["title"] == "测试歌曲"
+
+
+@pytest.mark.asyncio
+async def test_qq_music_card_fills_meta_from_detail() -> None:
+    client = make_client()
+    song = _MODULE.SongInfo(
+        song_id="song-mid",
+        name="",
+        artists="",
+        album="",
+        platform="qq",
+    )
+    detail = _MODULE.SongInfo(
+        song_id="song-mid",
+        name="详情标题",
+        artists="详情歌手",
+        album="详情专辑",
+        platform="qq",
+        media_id="detail-media-mid",
+        album_mid="detail-album-mid",
+    )
+    client.get_qq_song_detail = AsyncMock(return_value=detail)
+    client._get_qq_vkey_batch = AsyncMock(return_value=None)
+
+    payload = await client.qq_music_card(song)
+
+    assert payload is not None
+    assert payload["title"] == "详情标题"
+    assert payload["content"] == "详情歌手"
+    assert payload["image"] == (
+        "https://y.qq.com/music/photo_new/T002R300x300M000detail-album-mid.jpg?max_age=2592000"
+    )
+    client.get_qq_song_detail.assert_awaited_once_with("song-mid")
+    assert client._get_qq_vkey_batch.await_count == 2
+    assert client._get_qq_vkey_batch.await_args_list[0].args == (
+        ["C400detail-media-mid.m4a"],
+        "song-mid",
+    )
+    assert client._get_qq_vkey_batch.await_args_list[1].args == (
+        ["M500detail-media-mid.mp3"],
+        "song-mid",
+    )
+
+
+@pytest.mark.asyncio
+async def test_qq_music_card_detail_error_without_meta_returns_none() -> None:
+    client = make_client()
+    song = _MODULE.SongInfo(
+        song_id="song-mid",
+        name="",
+        artists="",
+        album="",
+        platform="qq",
+    )
+    client.get_qq_song_detail = AsyncMock(
+        side_effect=MusicAPIResponseError("QQ音乐歌曲详情查询超时: song_mid=song-mid")
+    )
+
+    assert await client.qq_music_card(song) is None
+
+
+@pytest.mark.asyncio
+async def test_qq_music_card_missing_album_mid_returns_none() -> None:
+    client = make_client()
+    song = _MODULE.SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="",
+        platform="qq",
+        media_id="media-mid",
+    )
+    client.get_qq_song_detail = AsyncMock(return_value=None)
+
+    assert await client.qq_music_card(song) is None
+
+
+@pytest.mark.asyncio
+async def test_qq_card_head_ok() -> None:
+    client = make_client()
+    client._qq_client = SimpleNamespace(
+        head=AsyncMock(return_value=SimpleNamespace(status_code=200))
+    )
+    assert await client._head_ok("https://example.test/a.m4a") is True
+
+    client._qq_client.head.return_value = SimpleNamespace(status_code=403)
+    assert await client._head_ok("https://example.test/a.m4a") is False
+
+    client._qq_client.head = AsyncMock(side_effect=RuntimeError("no route"))
+    assert await client._head_ok("https://example.test/a.m4a") is False
+
+
+@pytest.mark.asyncio
+async def test_napcat_send_message_to_group() -> None:
+    client = make_client()
+    client._napcat_client = SimpleNamespace(
+        post=AsyncMock(
+            return_value=FakeResponse({"status": "ok", "retcode": 0, "data": {"message_id": 123}})
+        )
+    )
+
+    ok, data = await client.napcat_send_message("[CQ:music,...]", group_id="657794518")
+
+    assert ok is True
+    assert data["data"]["message_id"] == 123
+    request_payload = client._napcat_client.post.await_args.kwargs["json"]
+    assert request_payload == {"group_id": 657794518, "message": "[CQ:music,...]"}
+
+
+@pytest.mark.asyncio
+async def test_napcat_send_message_to_private() -> None:
+    client = make_client()
+    client._napcat_client = SimpleNamespace(
+        post=AsyncMock(
+            return_value=FakeResponse({"status": "ok", "retcode": 0, "data": {"message_id": 456}})
+        )
+    )
+
+    ok, _ = await client.napcat_send_message("[CQ:music,...]", user_id="123456")
+
+    assert ok is True
+    request_payload = client._napcat_client.post.await_args.kwargs["json"]
+    assert request_payload == {"user_id": 123456, "message": "[CQ:music,...]"}
+
+
+@pytest.mark.asyncio
+async def test_napcat_send_message_business_failure_returns_false() -> None:
+    client = make_client()
+    client._napcat_client = SimpleNamespace(
+        post=AsyncMock(
+            return_value=FakeResponse({"status": "failed", "retcode": 100, "message": "bad"})
+        )
+    )
+
+    ok, data = await client.napcat_send_message("[CQ:music,...]", group_id="1")
+
+    assert ok is False
+    assert data["retcode"] == 100
+
+
+@pytest.mark.asyncio
+async def test_napcat_send_message_without_client_returns_false() -> None:
+    client = make_client()
+
+    ok, data = await client.napcat_send_message("[CQ:music,...]", group_id="1")
+
+    assert ok is False
+    assert data == {}
+
+
+@pytest.mark.asyncio
+async def test_napcat_send_message_missing_target_returns_false() -> None:
+    client = make_client()
+    client._napcat_client = SimpleNamespace(post=AsyncMock())
+
+    ok, data = await client.napcat_send_message("[CQ:music,...]")
+
+    assert ok is False
+    assert data == {}
+    client._napcat_client.post.assert_not_awaited()
+
+

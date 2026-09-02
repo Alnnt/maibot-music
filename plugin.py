@@ -17,6 +17,32 @@ from .music_api import MusicAPIResponseError, MusicSearchClient, SongInfo
 from .url_parser import extract_urls, parse_music_card_text, parse_music_url
 
 
+# ===== QQ 音乐卡片直连 NapCat（绕过 MaiBot 适配器） =====
+
+# CQ 转义规则：url/audio 值内的 & = 原样保留，
+# 仅对展示文本（title/content）按 OneBot 规范转义 & , [ ]
+_CQ_TEXT_ESCAPES = {"&": "&amp;", ",": "&#44;", "[": "&#91;", "]": "&#93;"}
+
+
+def _cq_escape_text(value: str) -> str:
+    """按 OneBot 规范转义自定义音乐卡片的展示文本。"""
+    return "".join(_CQ_TEXT_ESCAPES.get(char, char) for char in value)
+
+
+def _build_qq_music_card_cq(payload: dict[str, str]) -> str:
+    """把 qq_music_card 的字段拼成 NapCat 可识别的自定义音乐卡片 CQ 码。
+
+    audio 为空时省略 audio 参数，生成可点击跳转的卡片。
+    """
+    parts = ["[CQ:music,type=custom", "url=" + payload["url"]]
+    if payload.get("audio"):
+        parts.append("audio=" + payload["audio"])
+    parts.append("title=" + _cq_escape_text(payload["title"]))
+    parts.append("image=" + payload["image"])
+    parts.append("content=" + _cq_escape_text(payload["content"]))
+    return ",".join(parts) + "]"
+
+
 # ===== 配置模型 =====
 
 
@@ -28,7 +54,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.4.5", description="配置版本")
+    config_version: str = Field(default="1.4.6", description="配置版本")
 
 
 class MusicConfig(PluginConfigBase):
@@ -108,7 +134,7 @@ class QQMusicConfig(PluginConfigBase):
 
 
 class NapCatConfig(PluginConfigBase):
-    """NapCat HTTP API 配置（用于解析音乐卡片原始数据）。"""
+    """NapCat HTTP API 配置（解析音乐卡片原始数据、直连发送QQ音乐卡片）。"""
 
     __ui_label__ = "NapCat"
     __ui_icon__ = "server"
@@ -160,6 +186,8 @@ class MusicPlugin(MaiBotPlugin):
         # key: stream_id（等于消息的 session_id）, value: (结果列表, 平台, 创建时间戳)
         self._pending_choices: dict[str, tuple[list[SongInfo], str, float]] = {}
         self._pending_lock = asyncio.Lock()
+        # QQ 直连 NapCat 的目标缓存: stream_id -> {"group_id": ...} 或 {"user_id": ...}
+        self._qq_direct_targets: dict[str, dict[str, str]] = {}
 
     def _clean_expired_pending(self) -> None:
         """清理已过期的待选状态。"""
@@ -308,8 +336,11 @@ class MusicPlugin(MaiBotPlugin):
     async def _send_music_card(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
         """以音乐卡片形式发送歌曲。
 
-        通过 NapCat 平台型 music 段发送，只需 song_id 和 platform，
-        NapCat 负责从音乐平台拉取音频和卡片展示信息。
+        网易云音乐：通过 NapCat 平台型 music 段发送，只需 song_id，
+        NapCat 负责从网易云拉取音频和卡片展示信息。
+        QQ音乐：插件自解析歌曲详情与可播放直链（musicu.fcg，优先 m4a、
+        回退 mp3，HEAD 校验），发送包含 url/audio/title/image/content 的
+        自定义 music 段（type=custom），不依赖 NapCat 对 QQ 歌曲 ID 的内部解析。
 
         Args:
             song: SongInfo 对象。
@@ -320,6 +351,8 @@ class MusicPlugin(MaiBotPlugin):
             是否成功发送卡片。
         """
         try:
+            if song.platform == "qq":
+                return await self._send_qq_music_card(song, stream_id, silent=silent)
             sent = await self.ctx.send.custom(
                 "music",
                 {"type": song.platform, "id": song.song_id},
@@ -338,6 +371,171 @@ class MusicPlugin(MaiBotPlugin):
         if not silent:
             await self.ctx.send.text(song.display(), stream_id)
         return False
+
+    async def _send_qq_music_card(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
+        """发送可播放的 QQ 音乐自定义卡片（元数据与直链由插件自解析）。
+
+        优先直连 NapCat HTTP API 发送（Plan B，绕过 MaiBot 适配器对 music
+        段的改写）：把 url/audio/title/image/content 拼成自定义音乐卡片
+        CQ 码发给 /send_group_msg 或 /send_private_msg。直连不可用（未配置
+        NapCat 地址/无法解析目标/请求失败）时回退到自定义 music 段
+        （type=custom）走 MaiBot 适配器。
+
+        Returns:
+            是否成功发送卡片。
+        """
+        api = self._get_api()
+        try:
+            payload = await api.qq_music_card(song)
+        except Exception:
+            self.ctx.logger.exception("解析QQ音乐卡片失败: %s %s", song.platform, song.song_id)
+            if not silent:
+                await self.ctx.send.text(self._qq_card_fallback_text(song), stream_id)
+            return False
+
+        if payload is None:
+            self.ctx.logger.warning(
+                "QQ音乐卡片信息不足，无法构卡: %s %s",
+                song.platform,
+                song.song_id,
+            )
+            if not silent:
+                await self.ctx.send.text(self._qq_card_fallback_text(song), stream_id)
+            return False
+
+        # audio 为空表示直链不可用，此时生成的卡片不带 audio（跳转卡）
+        jump_card = not payload.get("audio")
+
+        # 1. 优先直连 NapCat 发送自定义音乐卡片
+        target = await self._resolve_qq_direct_target(stream_id)
+        if target is not None:
+            cq_message = _build_qq_music_card_cq(payload)
+            try:
+                direct_ok, _ = await api.napcat_send_message(cq_message, **target)
+            except Exception:
+                self.ctx.logger.exception(
+                    "QQ音乐卡片NapCat直连异常: %s %s",
+                    song.platform,
+                    song.song_id,
+                )
+                direct_ok = False
+            if direct_ok:
+                self.ctx.logger.info(
+                    "QQ音乐卡片已通过NapCat直连发送: %s %s target=%s",
+                    song.platform,
+                    song.song_id,
+                    next(iter(target)),
+                )
+                if jump_card and not silent:
+                    await self.ctx.send.text(
+                        "该歌曲受版权或登录限制无法直接播放，已发送可点击跳转的音乐卡片",
+                        stream_id,
+                    )
+                return True
+            self.ctx.logger.warning(
+                "QQ音乐卡片NapCat直连失败，回退适配器路径: %s %s",
+                song.platform,
+                song.song_id,
+            )
+
+        # 2. 回退：走 MaiBot 适配器自定义 music 段（部分适配器可透传 type=custom）
+        data = {key: value for key, value in payload.items() if value}
+        try:
+            sent = await self.ctx.send.custom("music", data, stream_id)
+        except Exception:
+            self.ctx.logger.exception("发送QQ音乐卡片失败: %s %s", song.platform, song.song_id)
+            if not silent:
+                await self.ctx.send.text(self._qq_card_fallback_text(song), stream_id)
+            return False
+
+        if not sent:
+            self.ctx.logger.warning("QQ音乐卡片发送失败: %s %s", song.platform, song.song_id)
+            if not silent:
+                await self.ctx.send.text(self._qq_card_fallback_text(song), stream_id)
+            return False
+
+        if jump_card and not silent:
+            await self.ctx.send.text(
+                "该歌曲受版权或登录限制无法直接播放，已发送可点击跳转的音乐卡片",
+                stream_id,
+            )
+        return True
+
+    def _remember_qq_direct_target(self, stream_id: str, message: dict[str, Any] | None) -> None:
+        """从 Hook/Command 的 message 中记录 QQ 直连目标（群号或QQ号）。
+
+        message 的 schema 由 MaiBot Host 提供：platform 为 "qq" 时，
+        message_info.group_info.group_id 表示群聊、message_info.user_info.user_id
+        表示私聊发送者（即私聊目标）。
+        """
+        if not stream_id or not isinstance(message, dict):
+            return
+        if str(message.get("platform") or "") != "qq":
+            return
+        message_info = message.get("message_info")
+        if not isinstance(message_info, dict):
+            return
+        group_id = ""
+        group_info = message_info.get("group_info")
+        if isinstance(group_info, dict):
+            group_id = str(group_info.get("group_id") or "")
+        user_id = ""
+        user_info = message_info.get("user_info")
+        if isinstance(user_info, dict):
+            user_id = str(user_info.get("user_id") or "")
+        if group_id:
+            self._qq_direct_targets[stream_id] = {"group_id": group_id}
+        elif user_id:
+            self._qq_direct_targets[stream_id] = {"user_id": user_id}
+
+    async def _resolve_qq_direct_target(self, stream_id: str) -> dict[str, str] | None:
+        """解析当前聊天流对应的 QQ 直连目标。
+
+        优先使用消息链路里记录的目标缓存；未命中时通过
+        ctx.chat.get_all_streams(platform="qq") 按 stream_id 反查群号/QQ号
+        （覆盖 Tool 等拿不到 message 的触发场景）。
+        """
+        targets = getattr(self, "_qq_direct_targets", None)
+        if not isinstance(targets, dict):
+            targets = {}
+        cached = targets.get(stream_id)
+        if cached:
+            return cached
+        if not stream_id:
+            return None
+        try:
+            chat = getattr(self.ctx, "chat", None)
+            if chat is None or not hasattr(chat, "get_all_streams"):
+                return None
+            streams = await chat.get_all_streams(platform="qq")
+        except Exception:
+            return None
+        if not isinstance(streams, list):
+            return None
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            if str(stream.get("stream_id") or stream.get("session_id") or "") != stream_id:
+                continue
+            group_id = str(stream.get("group_id") or "")
+            user_id = str(stream.get("user_id") or "")
+            if group_id:
+                target = {"group_id": group_id}
+            elif user_id:
+                target = {"user_id": user_id}
+            else:
+                continue
+            targets[stream_id] = target
+            return target
+        return None
+
+    @staticmethod
+    def _qq_card_fallback_text(song: SongInfo) -> str:
+        """QQ 音乐卡片无法生成/发送时的回退提示文本。"""
+        display = song.display().strip()
+        if display:
+            return f"「{display}」的QQ音乐卡片发送失败"
+        return "未能生成QQ音乐卡片，请稍后重试"
 
     async def _send_voice_audio(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
         """获取歌曲音频并以语音消息发送。"""
@@ -547,6 +745,7 @@ class MusicPlugin(MaiBotPlugin):
         与命令不同，Tool 调用时直接播放最佳匹配，不走"列出候选→用户选歌"流程。
         默认平台播放失败时自动换另一个平台重试，多首候选逐个尝试。
         """
+        self._remember_qq_direct_target(stream_id, kwargs.get("message"))
         del kwargs
         _TOOL_NAME = "search_and_play_music"
 
@@ -608,6 +807,7 @@ class MusicPlugin(MaiBotPlugin):
     )
     async def handle_music_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         """处理点歌命令。"""
+        self._remember_qq_direct_target(stream_id, kwargs.get("message"))
         matched_groups = kwargs.get("matched_groups")
         if not isinstance(matched_groups, dict):
             matched_groups = {}
@@ -647,6 +847,7 @@ class MusicPlugin(MaiBotPlugin):
     )
     async def handle_select_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         """处理选歌命令。"""
+        self._remember_qq_direct_target(stream_id, kwargs.get("message"))
         matched_groups = kwargs.get("matched_groups")
         if not isinstance(matched_groups, dict):
             matched_groups = {}
@@ -831,6 +1032,9 @@ class MusicPlugin(MaiBotPlugin):
 
         if not text or not session_id:
             return {"action": "continue"}
+
+        # 记录 QQ 会话目标，供直连 NapCat 发送音乐卡片使用
+        self._remember_qq_direct_target(session_id, message)
 
         # ── 1. 音乐卡片解析 ──
         if self.config.music.auto_parse_card:

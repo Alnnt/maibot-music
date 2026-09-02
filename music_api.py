@@ -80,6 +80,12 @@ _QQ_HEADERS = {
     "Referer": "https://y.qq.com/",
 }
 
+# QQ音乐卡片（插件自解析构造自定义卡片）所用模板与直链音质顺序
+_QQ_CARD_SONG_URL_TEMPLATE = "https://y.qq.com/n/ryqq/songDetail/{song_id}"
+_QQ_CARD_COVER_URL_TEMPLATE = "https://y.qq.com/music/photo_new/T002R300x300M000{album_mid}.jpg?max_age=2592000"
+# 直链优先 m4a(C400)，失败回退 mp3-128k(M500)
+_QQ_CARD_AUDIO_QUALITIES = (("C400", ".m4a"), ("M500", ".mp3"))
+
 
 class MusicAPIResponseError(RuntimeError):
     """音乐平台返回的响应不符合预期协议。"""
@@ -250,6 +256,7 @@ class SongInfo:
     album: str  # 专辑名
     platform: str  # "163" 或 "qq"
     media_id: str = ""  # QQ音乐的 strMediaMid（用于构造播放URL的filename）
+    album_mid: str = ""  # QQ音乐的专辑 mid（用于构造封面URL的filename）
 
     def display(self) -> str:
         """返回可读的歌曲描述。"""
@@ -654,6 +661,7 @@ class MusicSearchClient:
                 if isinstance(singer, dict) and singer.get("name")
             )
             album = str(album_data.get("name", "") or song.get("albumname", ""))
+            album_mid = str(album_data.get("mid", "") or "")
             media_mid = str(
                 file_data.get("media_mid", "")
                 or song.get("strMediaMid", "")
@@ -668,6 +676,7 @@ class MusicSearchClient:
                         album=album,
                         platform="qq",
                         media_id=media_mid,
+                        album_mid=album_mid,
                     )
                 )
         return results
@@ -760,6 +769,7 @@ class MusicSearchClient:
             if isinstance(singer, dict) and singer.get("name")
         )
         album = str(album_data.get("name", ""))
+        album_mid = str(album_data.get("mid", "") or "")
         media_mid = str(file_data.get("media_mid", ""))
 
         if not mid or not name:
@@ -772,6 +782,7 @@ class MusicSearchClient:
             album=album,
             platform="qq",
             media_id=media_mid,
+            album_mid=album_mid,
         )
 
     # ===== 获取音频 URL =====
@@ -1147,6 +1158,89 @@ class MusicSearchClient:
         )
         return None
 
+    # ===== QQ 音乐卡片（自解析元数据与直链，构造自定义卡片） =====
+
+    async def qq_music_card(self, song: SongInfo) -> dict[str, str] | None:
+        """构造可播放 QQ 音乐卡片所需的 OneBot music 段数据。
+
+        元数据与可播放直链全部由插件自解析：
+        - 元数据与可播放直链走 musicu.fcg，无需登录态即可用于多数歌曲
+          （若配置了 qq cookie，则同时享受账号权益）；
+        - 直链优先 m4a(C400)，失败回退 mp3-128k(M500)，取到后 HEAD 校验；
+        - 直链不可用时返回 audio 为空串的字段，调用方据此发送跳转卡；
+        - 无法取得标题或封面时返回 None，调用方按发送失败处理。
+
+        Args:
+            song: 歌曲信息（QQ 点歌搜索命中通常已带全元数据；
+                链接/卡片解析场景一般只有 song_id，会内部补查详情）。
+
+        Returns:
+            包含 type/url/title/image/content/audio 的字典，
+            audio 可能为空串（跳转卡）；无法构卡时返回 None。
+        """
+        song_id = song.song_id
+        if not song_id:
+            return None
+
+        # 元数据不足时补查歌曲详情（匿名可用）
+        name = song.name
+        artists = song.artists
+        media_id = song.media_id
+        album_mid = song.album_mid
+        if not (name and album_mid and media_id):
+            try:
+                detail = await self.get_qq_song_detail(song_id)
+            except MusicAPIResponseError:
+                detail = None
+            if detail is not None:
+                name = name or detail.name
+                artists = artists or detail.artists
+                media_id = media_id or detail.media_id
+                album_mid = album_mid or detail.album_mid
+
+        title = name.strip()
+        if not title or not album_mid:
+            # 缺少标题或封面（专辑 mid）时无法构卡
+            return None
+
+        # 可播放直链：优先 C400(m4a)，失败回退 M500(mp3)；HEAD 校验不可用则降级跳转卡
+        audio = ""
+        resource_mid = media_id or song_id
+        for prefix, ext in _QQ_CARD_AUDIO_QUALITIES:
+            if audio:
+                break
+            filename = f"{prefix}{resource_mid}{ext}"
+            candidate = await self._get_qq_vkey_batch([filename], song_id)
+            if candidate and await self._head_ok(candidate):
+                audio = candidate
+
+        return {
+            "type": "custom",
+            "url": _QQ_CARD_SONG_URL_TEMPLATE.format(song_id=song_id),
+            "title": title,
+            "image": _QQ_CARD_COVER_URL_TEMPLATE.format(album_mid=album_mid),
+            "content": artists,
+            "audio": audio,
+        }
+
+    async def _head_ok(self, url: str, timeout: float = 5.0) -> bool:
+        """HEAD 校验音频直链是否可用。
+
+        vkey 直链有时效，过期返回 403 等非 2xx；校验失败视为直链不可用。
+
+        Args:
+            url: 待校验的音频直链。
+            timeout: 单次校验超时（秒）。
+
+        Returns:
+            状态码为 2xx/3xx 返回 True，网络异常或状态码异常返回 False。
+        """
+        try:
+            resp = await self._qq_client.head(url, timeout=timeout)
+        except Exception:
+            return False
+        return 200 <= resp.status_code < 400
+
     # ===== 辅助方法 =====
 
     # 短链接重定向允许的目标域名白名单
@@ -1276,3 +1370,78 @@ class MusicSearchClient:
             return None
 
         return data
+
+    # ===== NapCat 直连发送（绕过 MaiBot 适配器的 music 段改写） =====
+
+    async def napcat_send_message(
+        self,
+        message: str,
+        *,
+        group_id: str = "",
+        user_id: str = "",
+    ) -> tuple[bool, dict[str, Any]]:
+        """直连 NapCat HTTP API 发送一条 OneBot 消息（CQ 字符串形式）。
+
+        用于发送 QQ 音乐自定义卡片：MaiBot 适配器只按固定结构处理 music
+        段（如仅 platform+id），会把带 url/audio/title/image/content 的
+        自定义卡片误判为不支持内容并降级成文本。此处直接调用
+        /send_group_msg 或 /send_private_msg 直发 OneBot 自定义音乐卡片，
+        仅在 napcat.http_url 已配置时可用。
+
+        Args:
+            message: 待发送的 CQ 消息文本。
+            group_id: 目标群号（群聊，与 user_id 二选一）。
+            user_id: 目标 QQ 号（私聊，与 group_id 二选一）。
+
+        Returns:
+            (是否成功, NapCat 完整响应 dict)。
+        """
+        napcat_client = getattr(self, "_napcat_client", None)
+        if napcat_client is None:
+            logger.warning("NapCat HTTP API 未配置，无法直连发送（napcat_url 为空）")
+            return False, {}
+
+        if not message:
+            return False, {}
+
+        if group_id:
+            path = "/send_group_msg"
+            payload: dict[str, Any] = {"group_id": int(group_id), "message": message}
+        elif user_id:
+            path = "/send_private_msg"
+            payload = {"user_id": int(user_id), "message": message}
+        else:
+            logger.warning("NapCat 直连发送缺少目标群号/QQ号")
+            return False, {}
+
+        try:
+            resp = await napcat_client.post(path, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            logger.warning(
+                "NapCat 直连发送请求失败: path=%s error=%s",
+                path,
+                type(exc).__name__,
+            )
+            return False, {}
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "NapCat 直连发送响应异常: path=%s type=%s",
+                path,
+                type(data).__name__,
+            )
+            return False, {}
+
+        ok = data.get("status") == "ok" or data.get("retcode") == 0
+        if not ok:
+            # 不回显整条消息（含 vkey 直链），只记录业务码
+            logger.warning(
+                "NapCat 直连发送业务失败: path=%s retcode=%r message=%r wording=%r",
+                path,
+                data.get("retcode"),
+                data.get("message"),
+                data.get("wording"),
+            )
+        return ok, data

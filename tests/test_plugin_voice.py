@@ -502,3 +502,360 @@ async def test_voice_send_waits_until_cache_gate_opens() -> None:
 
     assert await acquire_task == ("local", cache)
     await plugin._release_voice_send()
+
+
+def _make_card_plugin(api: object) -> object:
+    plugin = object.__new__(MusicPlugin)
+    plugin._qq_direct_targets = {}
+    plugin._ctx = types.SimpleNamespace(
+        send=types.SimpleNamespace(
+            custom=AsyncMock(return_value=True),
+            text=AsyncMock(),
+        ),
+        logger=types.SimpleNamespace(info=Mock(), warning=Mock(), exception=Mock()),
+    )
+    plugin._get_api = lambda: api
+    return plugin
+
+
+_QQ_CARD_PAYLOAD = {
+    "type": "custom",
+    "url": "https://y.qq.com/n/ryqq/songDetail/song-mid",
+    "title": "测试歌曲",
+    "image": "https://y.qq.com/music/photo_new/T002R300x300M000album-mid.jpg?max_age=2592000",
+    "content": "测试歌手",
+    "audio": "https://example.test/song.m4a?vkey=secret",
+}
+
+
+@pytest.mark.asyncio
+async def test_send_music_card_qq_uses_custom_card_payload() -> None:
+    api = types.SimpleNamespace(qq_music_card=AsyncMock(return_value=dict(_QQ_CARD_PAYLOAD)))
+    plugin = _make_card_plugin(api)
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="测试专辑",
+        platform="qq",
+    )
+
+    sent = await plugin._send_music_card(song, "stream-1")
+
+    assert sent is True
+    api.qq_music_card.assert_awaited_once_with(song)
+    plugin.ctx.send.custom.assert_awaited_once_with(
+        "music",
+        dict(_QQ_CARD_PAYLOAD),
+        "stream-1",
+    )
+    plugin.ctx.send.text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_qq_music_card_without_audio_sends_jump_card_with_hint() -> None:
+    payload = dict(_QQ_CARD_PAYLOAD)
+    payload["audio"] = ""
+    api = types.SimpleNamespace(qq_music_card=AsyncMock(return_value=payload))
+    plugin = _make_card_plugin(api)
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="",
+        platform="qq",
+    )
+
+    sent = await plugin._send_music_card(song, "stream-1")
+
+    assert sent is True
+    expected = {key: value for key, value in payload.items() if value}
+    assert "audio" not in expected
+    plugin.ctx.send.custom.assert_awaited_once_with("music", expected, "stream-1")
+    plugin.ctx.send.text.assert_awaited_once_with(
+        "该歌曲受版权或登录限制无法直接播放，已发送可点击跳转的音乐卡片",
+        "stream-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_qq_music_card_jump_card_silent_has_no_hint() -> None:
+    payload = dict(_QQ_CARD_PAYLOAD)
+    payload["audio"] = ""
+    api = types.SimpleNamespace(qq_music_card=AsyncMock(return_value=payload))
+    plugin = _make_card_plugin(api)
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="",
+        platform="qq",
+    )
+
+    sent = await plugin._send_music_card(song, "stream-1", silent=True)
+
+    assert sent is True
+    plugin.ctx.send.text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_qq_music_card_payload_none_notifies_and_returns_false() -> None:
+    api = types.SimpleNamespace(qq_music_card=AsyncMock(return_value=None))
+    plugin = _make_card_plugin(api)
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="",
+        platform="qq",
+    )
+
+    sent = await plugin._send_music_card(song, "stream-1")
+
+    assert sent is False
+    plugin.ctx.send.custom.assert_not_awaited()
+    plugin.ctx.send.text.assert_awaited_once_with(
+        "「测试歌曲 - 测试歌手」的QQ音乐卡片发送失败",
+        "stream-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_qq_music_card_error_uses_logger_and_fallback() -> None:
+    api = types.SimpleNamespace(qq_music_card=AsyncMock(side_effect=RuntimeError("boom")))
+    plugin = _make_card_plugin(api)
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="",
+        platform="qq",
+    )
+
+    sent = await plugin._send_music_card(song, "stream-1")
+
+    assert sent is False
+    plugin.ctx.logger.exception.assert_called_once()
+    plugin.ctx.send.custom.assert_not_awaited()
+    plugin.ctx.send.text.assert_awaited_once_with(
+        "「测试歌曲 - 测试歌手」的QQ音乐卡片发送失败",
+        "stream-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_qq_music_card_payload_none_silent_stays_quiet() -> None:
+    api = types.SimpleNamespace(qq_music_card=AsyncMock(return_value=None))
+    plugin = _make_card_plugin(api)
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="",
+        platform="qq",
+    )
+
+    sent = await plugin._send_music_card(song, "stream-1", silent=True)
+
+    assert sent is False
+    plugin.ctx.send.custom.assert_not_awaited()
+    plugin.ctx.send.text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_music_card_netease_keeps_platform_segment() -> None:
+    plugin = _make_card_plugin(types.SimpleNamespace())
+    song = SongInfo(
+        song_id="123",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="",
+        platform="163",
+    )
+
+    sent = await plugin._send_music_card(song, "stream-1")
+
+    assert sent is True
+    plugin.ctx.send.custom.assert_awaited_once_with(
+        "music",
+        {"type": "163", "id": "123"},
+        "stream-1",
+    )
+    plugin.ctx.send.text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_qq_music_card_prefers_direct_napcat_send() -> None:
+    api = types.SimpleNamespace(
+        qq_music_card=AsyncMock(return_value=dict(_QQ_CARD_PAYLOAD)),
+        napcat_send_message=AsyncMock(return_value=(True, {"status": "ok"})),
+    )
+    plugin = _make_card_plugin(api)
+    plugin._qq_direct_targets = {"stream-1": {"group_id": "12345"}}
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="",
+        platform="qq",
+    )
+
+    sent = await plugin._send_music_card(song, "stream-1")
+
+    assert sent is True
+    expected_cq = (
+        "[CQ:music,type=custom,url=https://y.qq.com/n/ryqq/songDetail/song-mid,"
+        "audio=https://example.test/song.m4a?vkey=secret,title=测试歌曲,"
+        "image=https://y.qq.com/music/photo_new/T002R300x300M000album-mid.jpg?max_age=2592000,"
+        "content=测试歌手]"
+    )
+    api.napcat_send_message.assert_awaited_once_with(expected_cq, group_id="12345")
+    plugin.ctx.send.custom.assert_not_awaited()
+    plugin.ctx.send.text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_qq_music_card_direct_fail_falls_back_to_adapter() -> None:
+    api = types.SimpleNamespace(
+        qq_music_card=AsyncMock(return_value=dict(_QQ_CARD_PAYLOAD)),
+        napcat_send_message=AsyncMock(return_value=(False, {"retcode": 100, "message": "x"})),
+    )
+    plugin = _make_card_plugin(api)
+    plugin._qq_direct_targets = {"stream-1": {"user_id": "987654"}}
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="",
+        platform="qq",
+    )
+
+    sent = await plugin._send_music_card(song, "stream-1")
+
+    assert sent is True
+    api.napcat_send_message.assert_awaited_once()
+    plugin.ctx.send.custom.assert_awaited_once_with(
+        "music",
+        dict(_QQ_CARD_PAYLOAD),
+        "stream-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_qq_music_card_resolves_target_via_chat_streams() -> None:
+    api = types.SimpleNamespace(
+        qq_music_card=AsyncMock(return_value=dict(_QQ_CARD_PAYLOAD)),
+        napcat_send_message=AsyncMock(return_value=(True, {"status": "ok"})),
+    )
+    plugin = _make_card_plugin(api)
+    plugin._ctx.chat = types.SimpleNamespace(
+        get_all_streams=AsyncMock(
+            return_value=[
+                {
+                    "stream_id": "other-stream",
+                    "platform": "qq",
+                    "group_id": "",
+                    "user_id": "1",
+                },
+                {
+                    "stream_id": "stream-1",
+                    "platform": "qq",
+                    "group_id": "111222",
+                    "user_id": "2",
+                },
+            ]
+        )
+    )
+    song = SongInfo(
+        song_id="song-mid",
+        name="测试歌曲",
+        artists="测试歌手",
+        album="",
+        platform="qq",
+    )
+
+    sent = await plugin._send_music_card(song, "stream-1")
+
+    assert sent is True
+    plugin._ctx.chat.get_all_streams.assert_awaited_once_with(platform="qq")
+    api.napcat_send_message.assert_awaited_once()
+    assert api.napcat_send_message.await_args.kwargs == {"group_id": "111222"}
+    # 命中后写入缓存
+    assert plugin._qq_direct_targets == {"stream-1": {"group_id": "111222"}}
+
+
+@pytest.mark.asyncio
+async def test_remember_qq_direct_target_from_group_message() -> None:
+    plugin = object.__new__(MusicPlugin)
+    plugin._qq_direct_targets = {}
+    message = {
+        "platform": "qq",
+        "session_id": "stream-1",
+        "message_info": {
+            "group_info": {"group_id": "657794518", "group_name": "测试群"},
+            "user_info": {"user_id": "10001", "user_nickname": "某人"},
+        },
+    }
+
+    plugin._remember_qq_direct_target("stream-1", message)
+
+    assert plugin._qq_direct_targets == {"stream-1": {"group_id": "657794518"}}
+
+
+@pytest.mark.asyncio
+async def test_remember_qq_direct_target_from_private_message() -> None:
+    plugin = object.__new__(MusicPlugin)
+    plugin._qq_direct_targets = {}
+    message = {
+        "platform": "qq",
+        "session_id": "stream-2",
+        "message_info": {
+            "group_info": None,
+            "user_info": {"user_id": "10002", "user_nickname": "某人"},
+        },
+    }
+
+    plugin._remember_qq_direct_target("stream-2", message)
+
+    assert plugin._qq_direct_targets == {"stream-2": {"user_id": "10002"}}
+
+
+@pytest.mark.asyncio
+async def test_remember_qq_direct_target_ignores_non_qq_platform() -> None:
+    plugin = object.__new__(MusicPlugin)
+    plugin._qq_direct_targets = {}
+    message = {
+        "platform": "webui",
+        "session_id": "stream-3",
+        "message_info": {
+            "group_info": {"group_id": "1"},
+            "user_info": {"user_id": "1"},
+        },
+    }
+
+    plugin._remember_qq_direct_target("stream-3", message)
+
+    assert plugin._qq_direct_targets == {}
+
+
+def test_build_qq_music_card_cq_escapes_display_text() -> None:
+    payload = {
+        "type": "custom",
+        "url": "https://y.qq.com/n/ryqq/songDetail/song-mid",
+        "title": "测试,歌曲[特别版]&Live",
+        "image": "https://example.test/cover.jpg?x=1",
+        "content": "歌手A,歌手B",
+        "audio": "",
+    }
+
+    cq = plugin_module._build_qq_music_card_cq(payload)
+
+    assert cq == (
+        "[CQ:music,type=custom,url=https://y.qq.com/n/ryqq/songDetail/song-mid,"
+        "title=测试&#44;歌曲&#91;特别版&#93;&amp;Live,"
+        "image=https://example.test/cover.jpg?x=1,"
+        "content=歌手A&#44;歌手B]"
+    )
+    assert "audio=" not in cq
+
+

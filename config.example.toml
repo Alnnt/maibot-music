@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.4.5"
+config_version = "1.4.6"
 
 [music]
 default_platform = "163"
@@ -28,5 +28,5 @@ uin = ""                # QQ音乐登录账号，搜索必需
 qqmusic_key = ""        # QQ音乐登录凭证，搜索必需，账号权益影响可播放范围
 
 [napcat]
-http_url = "http://127.0.0.1:9999"
-http_token = ""
+http_url = "http://127.0.0.1:9999"   # 解析音乐卡片原始数据 + 直连发送QQ音乐卡片
+http_token = ""                      # NapCat 访问令牌（留空则不鉴权）
